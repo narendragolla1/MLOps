@@ -7,12 +7,20 @@ so the rest of the framework never touches backend-specific details.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
 from omniai.engine.backends import ADAPTERS, BackendAdapter
 from omniai.engine.config import EngineConfig
+from omniai.engine.resilience import (
+    CircuitBreaker,
+    EngineSupervisor,
+    EngineUnavailable,
+    with_retries,
+)
 from omniai.telemetry import traced_span
 
 
@@ -24,10 +32,27 @@ class ModelEngine:
         self.adapter = adapter
         self.system_prompt: str | None = None
         self.active_lora: str | None = None
+        self.active_lora_path: str | None = None
+        self.breaker = CircuitBreaker(
+            failure_threshold=config.breaker_failure_threshold,
+            reset_timeout=config.breaker_reset_s,
+        )
+        self.supervisor: EngineSupervisor | None = None
+        # Observability hook: called with (prompt_tokens, completion_tokens).
+        self.on_usage: Any = None
+        self.in_flight = 0
         self._client: httpx.AsyncClient | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        # Created lazily so the engine can be constructed outside a loop.
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+        return self._semaphore
 
     @classmethod
-    def create(cls, config: EngineConfig | dict[str, Any]) -> "ModelEngine":
+    def create(cls, config: EngineConfig | dict[str, Any]) -> ModelEngine:
         """Factory: build the engine with the adapter for ``config.backend``."""
         if isinstance(config, dict):
             config = EngineConfig(**config)
@@ -39,26 +64,72 @@ class ModelEngine:
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(base_url=self.config.base_url, timeout=120.0)
+            self._client = httpx.AsyncClient(
+                base_url=self.config.base_url, timeout=self.config.request_timeout_s
+            )
         return self._client
 
-    async def start(self, wait: bool = True, timeout: float = 300.0) -> None:
-        """Launch the backend subprocess and optionally wait for readiness."""
+    async def start(
+        self, wait: bool = True, timeout: float = 300.0, supervise: bool = False
+    ) -> None:
+        """Launch (or attach to) the backend; optionally supervise it.
+
+        In unmanaged mode (``config.managed=False``) no subprocess is
+        spawned — the engine attaches to the server at
+        ``config.external_base_url`` and only health-checks it.
+        """
+        if not self.config.managed:
+            if wait and not await self.adapter.wait_ready(timeout=timeout):
+                raise EngineUnavailable(
+                    f"external engine at {self.config.base_url} not ready within {timeout}s"
+                )
+            return
         self.adapter.start()
         if wait:
             ready = await self.adapter.wait_ready(timeout=timeout)
             if not ready:
                 self.adapter.stop()
-                raise RuntimeError(
-                    f"{self.config.backend.value} server did not become ready "
-                    f"within {timeout}s"
+                raise EngineUnavailable(
+                    f"{self.config.backend.value} server did not become ready within {timeout}s"
                 )
+        if supervise:
+            self.supervisor = EngineSupervisor(self)
+            self.supervisor.start()
 
     async def stop(self) -> None:
-        self.adapter.stop()
+        if self.supervisor is not None:
+            await self.supervisor.stop()
+            self.supervisor = None
+        if self.config.managed:
+            self.adapter.stop()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def _post(self, path: str, payload: dict[str, Any]) -> httpx.Response:
+        """POST with retry + circuit breaker; raises EngineUnavailable when down."""
+
+        async def attempt() -> httpx.Response:
+            resp = await self.client.post(path, json=payload)
+            resp.raise_for_status()
+            return resp
+
+        async def guarded() -> httpx.Response:
+            return await with_retries(attempt, attempts=self.config.retries)
+
+        try:
+            async with self.semaphore:  # backpressure toward the backend
+                self.in_flight += 1
+                try:
+                    return await self.breaker.call(guarded)
+                finally:
+                    self.in_flight -= 1
+        except EngineUnavailable:
+            raise
+        except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 500:
+                raise  # client errors are the caller's bug, not availability
+            raise EngineUnavailable(f"engine request failed: {exc}") from exc
 
     def set_system_prompt(self, prompt: str) -> None:
         """Pre-cache a system prompt prepended to every conversation.
@@ -87,16 +158,16 @@ class ModelEngine:
         with traced_span(
             "engine.chat", {"model": payload["model"], "backend": self.config.backend.value}
         ) as span:
-            resp = await self.client.post("/v1/chat/completions", json=payload)
-            resp.raise_for_status()
+            resp = await self._post("/v1/chat/completions", payload)
             data = resp.json()
             usage = data.get("usage") or {}
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
             span.set_attributes(
-                {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                }
+                {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
             )
+            if self.on_usage is not None:
+                self.on_usage(prompt_tokens, completion_tokens)
             return data
 
     async def chat_text(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
@@ -133,8 +204,8 @@ class ModelEngine:
         endpoint = self.adapter.lora_load_endpoint()
         payload = self.adapter.lora_load_payload(name, path)
         with traced_span("engine.load_lora", {"adapter": name}):
-            resp = await self.client.post(endpoint, json=payload)
-            resp.raise_for_status()
+            await self._post(endpoint, payload)
         if activate:
             self.active_lora = name
+            self.active_lora_path = path
         return True

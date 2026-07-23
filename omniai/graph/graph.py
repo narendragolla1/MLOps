@@ -9,7 +9,8 @@ the state — lambdas work). Cycles are allowed and bounded by
 from __future__ import annotations
 
 import inspect
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from omniai.graph.state import State
 from omniai.telemetry import traced_span
@@ -38,9 +39,11 @@ class Graph:
     def add_node(self, name: str, fn: NodeFn | None = None) -> Any:
         """Register a node; usable directly or as ``@graph.add_node("name")``."""
         if fn is None:
+
             def decorator(f: NodeFn) -> NodeFn:
                 self.add_node(name, f)
                 return f
+
             return decorator
         if name in (START, END):
             raise GraphError(f"{name!r} is reserved")
@@ -75,7 +78,7 @@ class Graph:
             raise GraphError(f"Node {source!r} already has a static edge")
         self.conditional_edges[source] = (router, path_map)
 
-    def compile(self, max_iterations: int = 25) -> "CompiledGraph":
+    def compile(self, max_iterations: int = 25) -> CompiledGraph:
         if self.entry_point is None:
             raise GraphError("No entry point set (use set_entry_point or add_edge(START, ...))")
         referenced = {self.entry_point, *self.edges.values()}
@@ -109,9 +112,7 @@ class CompiledGraph:
             target = router(state)
             if path_map is not None:
                 if target not in path_map:
-                    raise GraphError(
-                        f"Router at {current!r} returned {target!r}, not in path map"
-                    )
+                    raise GraphError(f"Router at {current!r} returned {target!r}, not in path map")
                 target = path_map[target]
             return target
         return self.graph.edges.get(current, END)
@@ -120,6 +121,7 @@ class CompiledGraph:
         """Execute the graph from the entry point until END."""
         if isinstance(state, dict):
             state = self.graph.state_type.model_validate(state)
+        assert isinstance(state, State)
         current = self.graph.entry_point
         for _ in range(self.max_iterations):
             if current == END:

@@ -1,6 +1,6 @@
 """OmniAI / NexusGraph: unified LLM orchestration and serving framework."""
 
-from omniai.protocol import OmniMessage, Role, Channel
+from omniai.protocol import Channel, OmniMessage, Role
 
 __version__ = "0.1.0"
 

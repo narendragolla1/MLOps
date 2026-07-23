@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Awaitable, Callable, get_type_hints
+from collections.abc import Callable
+from typing import Any, get_type_hints
 
 from pydantic import BaseModel, create_model
 
@@ -22,7 +23,9 @@ class ToolValidationError(Exception):
 class Tool:
     """A callable wrapped with an auto-generated argument schema."""
 
-    def __init__(self, fn: Callable[..., Any], name: str | None = None, description: str | None = None):
+    def __init__(
+        self, fn: Callable[..., Any], name: str | None = None, description: str | None = None
+    ):
         self.fn = fn
         self.name = name or fn.__name__
         self.description = description or inspect.getdoc(fn) or ""

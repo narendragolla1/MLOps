@@ -33,6 +33,21 @@ DEFAULT_PII_PATTERNS: dict[str, str] = {
 }
 
 
+def _luhn_valid(candidate: str) -> bool:
+    """Luhn checksum over the digits in ``candidate`` (card-number check)."""
+    digits = [int(ch) for ch in candidate if ch.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for idx, digit in enumerate(reversed(digits)):
+        if idx % 2 == 1:
+            digit *= 2
+            if digit > 9:
+                digit -= 9
+        total += digit
+    return total % 10 == 0
+
+
 @dataclass
 class GuardrailPolicy:
     injection_patterns: dict[str, str] = field(
@@ -70,7 +85,22 @@ class PromptGuard:
         sanitized = text
         pii_hits = []
         for name, rx in self._pii.items():
-            sanitized, n = rx.subn(self.policy.redact_template.format(kind=name), sanitized)
+            replacement = self.policy.redact_template.format(kind=name)
+            if name == "credit_card":
+                # A bare 13-16 digit run is often an order/tracking number;
+                # only redact sequences that pass the Luhn checksum.
+                n = 0
+
+                def _redact_if_card(match: re.Match[str], repl: str = replacement) -> str:
+                    nonlocal n
+                    if _luhn_valid(match.group()):
+                        n += 1
+                        return repl
+                    return match.group()
+
+                sanitized = rx.sub(_redact_if_card, sanitized)
+            else:
+                sanitized, n = rx.subn(replacement, sanitized)
             if n:
                 pii_hits.append(name)
         blocked = bool(injection_hits) and self.policy.block_on_injection

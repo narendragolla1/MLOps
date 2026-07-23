@@ -24,16 +24,17 @@ def test_vllm_command_maps_hardware_optimizations():
     )
     cmd = VLLMAdapter(config).build_command()
     assert cmd[:3] == ["vllm", "serve", "m"]
-    assert ("--quantization", "fp8") == tuple(cmd[cmd.index("--quantization"):][:2])
+    assert tuple(cmd[cmd.index("--quantization") :][:2]) == ("--quantization", "fp8")
     assert "--kv-cache-dtype" in cmd  # fp8 quantization also quantizes the KV cache
-    assert ("--tensor-parallel-size", "2") == tuple(cmd[cmd.index("--tensor-parallel-size"):][:2])
-    assert ("--gpu-memory-utilization", "0.9") == tuple(
-        cmd[cmd.index("--gpu-memory-utilization"):][:2]
+    assert tuple(cmd[cmd.index("--tensor-parallel-size") :][:2]) == ("--tensor-parallel-size", "2")
+    assert tuple(cmd[cmd.index("--gpu-memory-utilization") :][:2]) == (
+        "--gpu-memory-utilization",
+        "0.9",
     )
-    assert ("--max-model-len", "8192") == tuple(cmd[cmd.index("--max-model-len"):][:2])
+    assert tuple(cmd[cmd.index("--max-model-len") :][:2]) == ("--max-model-len", "8192")
     assert "--enable-lora" in cmd
     assert "--enforce-eager" in cmd
-    assert ("--seed", "42") == tuple(cmd[cmd.index("--seed"):][:2])
+    assert tuple(cmd[cmd.index("--seed") :][:2]) == ("--seed", "42")
 
 
 def test_vllm_rejects_unsupported_kv_cache():
@@ -43,13 +44,11 @@ def test_vllm_rejects_unsupported_kv_cache():
 
 
 def test_sglang_command_mapping():
-    config = EngineConfig(
-        model="m", backend="sglang", quantization="fp8", tensor_parallel_size=4
-    )
+    config = EngineConfig(model="m", backend="sglang", quantization="fp8", tensor_parallel_size=4)
     cmd = SGLangAdapter(config).build_command()
     assert "sglang.launch_server" in cmd
-    assert ("--model-path", "m") == tuple(cmd[cmd.index("--model-path"):][:2])
-    assert ("--tp", "4") == tuple(cmd[cmd.index("--tp"):][:2])
+    assert tuple(cmd[cmd.index("--model-path") :][:2]) == ("--model-path", "m")
+    assert tuple(cmd[cmd.index("--tp") :][:2]) == ("--tp", "4")
     assert "--enable-lora" in cmd
 
 
@@ -61,9 +60,7 @@ def test_tensor_parallel_must_be_positive():
 def _mock_engine(handler) -> ModelEngine:
     engine = ModelEngine.create({"model": "m", "backend": "vllm"})
     transport = httpx.MockTransport(handler)
-    engine._client = httpx.AsyncClient(
-        base_url=engine.config.base_url, transport=transport
-    )
+    engine._client = httpx.AsyncClient(base_url=engine.config.base_url, transport=transport)
     return engine
 
 

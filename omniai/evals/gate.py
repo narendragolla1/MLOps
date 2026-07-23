@@ -36,7 +36,7 @@ class GoldenDataset:
     cases: list[GoldenCase] = field(default_factory=list)
 
     @classmethod
-    def from_jsonl(cls, path: str | Path) -> "GoldenDataset":
+    def from_jsonl(cls, path: str | Path) -> GoldenDataset:
         cases = []
         for line in Path(path).read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -101,9 +101,7 @@ class AdapterGate:
         failures: list[str] = []
         for case in self.dataset.cases:
             kwargs = {"model": model} if model else {}
-            text = await self.engine.chat_text(
-                [{"role": "user", "content": case.prompt}], **kwargs
-            )
+            text = await self.engine.chat_text([{"role": "user", "content": case.prompt}], **kwargs)
             tool_name, args = _parse_tool_call(text)
             if not case.matches(tool_name, args):
                 failures.append(case.prompt)
@@ -119,12 +117,14 @@ class AdapterGate:
         """Score a candidate adapter and accept/reject it vs the baseline."""
         if self.baseline_accuracy is None:
             await self.establish_baseline()
+        baseline = self.baseline_accuracy
+        assert baseline is not None  # establish_baseline always sets it
         accuracy, failures = await self.score(model=adapter_name)
-        accepted = accuracy >= self.baseline_accuracy - self.tolerance
+        accepted = accuracy >= baseline - self.tolerance
         return EvalVerdict(
             accepted=accepted,
             accuracy=accuracy,
-            baseline=self.baseline_accuracy,
+            baseline=baseline,
             adapter=adapter_name,
             failures=failures,
         )

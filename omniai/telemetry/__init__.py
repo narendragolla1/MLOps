@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
 try:  # pragma: no cover - exercised only when otel is installed
     from opentelemetry import trace as _otel_trace

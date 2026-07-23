@@ -41,6 +41,18 @@ def test_pii_redaction():
     assert set(result.pii_hits) >= {"email", "phone", "ssn"}
 
 
+def test_credit_card_redaction_requires_luhn_checksum():
+    guard = PromptGuard()
+    # 4111 1111 1111 1111 is Luhn-valid (classic test card); redacted.
+    result = guard.check("card: 4111 1111 1111 1111")
+    assert "credit_card" in result.pii_hits
+    assert "4111" not in result.sanitized
+    # Same shape but Luhn-invalid: an order number, left alone.
+    result = guard.check("order number 4111 1111 1111 1112")
+    assert "credit_card" not in result.pii_hits
+    assert "1112" in result.sanitized
+
+
 def test_interceptor_blocks_and_redacts():
     guard = PromptGuard()
     with pytest.raises(GuardrailViolation):
@@ -73,6 +85,7 @@ def test_policy_is_extensible():
 
 
 # -- telemetry -------------------------------------------------------------
+
 
 def test_traced_span_records_latency_and_attributes():
     recorder.clear()

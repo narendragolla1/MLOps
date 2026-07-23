@@ -7,13 +7,13 @@ adapter maps those settings to its own CLI flags.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 
-class Backend(str, Enum):
+class Backend(StrEnum):
     VLLM = "vllm"
     SGLANG = "sglang"
 
@@ -25,6 +25,21 @@ class EngineConfig(BaseModel):
     backend: Backend = Backend.VLLM
     host: str = "127.0.0.1"
     port: int = 8000
+
+    # Process ownership: managed=True spawns/supervises the server subprocess;
+    # managed=False attaches to an already-running server (e.g. the vLLM
+    # container in the compose stack) at external_base_url.
+    managed: bool = True
+    external_base_url: str | None = None
+
+    # Reliability knobs for the HTTP client around the backend.
+    request_timeout_s: float = 120.0
+    retries: int = 3
+    breaker_failure_threshold: int = 5
+    breaker_reset_s: float = 30.0
+    # Backpressure: bound on concurrent in-flight requests to the backend so
+    # a burst that passes the rate limiter cannot pile onto the server.
+    max_concurrent_requests: int = 32
 
     # Hardware optimizations (mapped per-backend by the adapters).
     quantization: str | None = None  # e.g. "fp8", "awq", "gptq"
@@ -46,4 +61,6 @@ class EngineConfig(BaseModel):
 
     @property
     def base_url(self) -> str:
+        if self.external_base_url:
+            return self.external_base_url.rstrip("/")
         return f"http://{self.host}:{self.port}"

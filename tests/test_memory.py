@@ -1,7 +1,6 @@
 import asyncio
 
 import httpx
-import pytest
 
 from omniai.engine import ModelEngine
 from omniai.memory import (
@@ -12,7 +11,6 @@ from omniai.memory import (
     format_training_pairs,
 )
 from omniai.protocol import OmniMessage, Role
-
 
 # -- skills ----------------------------------------------------------------
 
@@ -47,6 +45,7 @@ def test_skill_loader_installs_into_engine(tmp_path):
 
 # -- interaction buffer ----------------------------------------------------
 
+
 async def test_buffer_logs_and_fetches(tmp_path):
     buffer = InteractionBuffer(tmp_path / "log.db")
     await buffer.log(OmniMessage(content="hi", session_id="a", role=Role.USER))
@@ -71,6 +70,7 @@ async def test_buffer_threshold_trigger(tmp_path):
 
 # -- training pair formatting ----------------------------------------------
 
+
 def _row(role, content, session="s"):
     return {"session_id": session, "role": role, "content": content}
 
@@ -93,6 +93,7 @@ def test_format_training_pairs_with_tool_context():
 
 
 # -- continuous learning cycle ---------------------------------------------
+
 
 def fake_train(base_model, pairs, output_dir, **hp):
     return output_dir  # pretend the adapter was written
@@ -125,7 +126,47 @@ async def test_full_cycle_trains_and_hot_swaps(tmp_path):
     assert report["status"] == "deployed"
     assert report["pairs"] == 1
     assert engine.swaps == [(report["adapter"], report["path"])]
-    assert "lora-v1" in report["adapter"]
+    assert "-lora-" in report["adapter"]
+    buffer.close()
+
+
+async def test_adapter_names_unique_across_trainer_instances(tmp_path):
+    pairs = [{"prompt": "p", "completion": "c"}]
+    names = set()
+    for _ in range(2):  # fresh trainer each time simulates a process restart
+        trainer = LoRATrainer("base/model", tmp_path / "adapters", train_fn=fake_train)
+        name, _ = await trainer.train(pairs)
+        names.add(name)
+    assert len(names) == 2
+
+
+async def test_incremental_training_uses_high_water_mark(tmp_path):
+    trained_batches = []
+
+    def spy_train(base_model, pairs, output_dir, **hp):
+        trained_batches.append(len(pairs))
+        return output_dir
+
+    buffer = InteractionBuffer(tmp_path / "log.db")
+    await _seed(buffer)
+    engine = SwapRecordingEngine()
+    trainer = LoRATrainer("base/model", tmp_path / "adapters", executor=None, train_fn=spy_train)
+    # thread-friendly: spy closure can't cross a process boundary
+    from concurrent.futures import ThreadPoolExecutor
+
+    trainer.executor = ThreadPoolExecutor(max_workers=1)
+    learner = ContinuousLearner(buffer, trainer, engine=engine)
+
+    assert (await learner.run_cycle())["status"] == "deployed"
+    # No new data: second cycle must skip instead of retraining everything.
+    assert (await learner.run_cycle())["status"] == "skipped"
+
+    await buffer.log(OmniMessage(content="q2", role=Role.USER, session_id="s2"))
+    await buffer.log(OmniMessage(content="a2", role=Role.ASSISTANT, session_id="s2"))
+    report = await learner.run_cycle()
+    assert report["status"] == "deployed"
+    assert report["pairs"] == 1  # only the new pair, not the full history
+    assert trained_batches == [1, 1]
     buffer.close()
 
 
@@ -143,9 +184,7 @@ async def test_eval_gate_rejects_bad_adapter(tmp_path):
     await _seed(buffer)
     engine = SwapRecordingEngine()
     trainer = LoRATrainer("base/model", tmp_path / "adapters", train_fn=fake_train)
-    learner = ContinuousLearner(
-        buffer, trainer, engine=engine, evaluator=lambda name, path: False
-    )
+    learner = ContinuousLearner(buffer, trainer, engine=engine, evaluator=lambda name, path: False)
     report = await learner.run_cycle()
     assert report["status"] == "rejected"
     assert engine.swaps == []

@@ -6,9 +6,9 @@ import json, pathlib, uvicorn
 from omniai.engine import ModelEngine
 from omniai.gateway import GatewayRouter
 from omniai.graph import END, START, Graph, State, tool
+from omniai.graph.tools import render_tool_prompt
 from omniai.guardrails import PromptGuard
 from omniai.memory import ContinuousLearner, InteractionBuffer, LoRATrainer, SkillLoader
-from omniai.graph.tools import render_tool_prompt
 
 @tool
 def get_weather(city: str) -> str:
