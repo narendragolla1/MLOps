@@ -24,8 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from omniai.memory.models import Interaction
+from omniai.memory.models import Interaction, TrainingState
 from omniai.protocol import OmniMessage
+
+_WATERMARK_KEY = "watermark"
 
 
 def _to_url(target: str | Path) -> str:
@@ -131,7 +133,10 @@ class InteractionBuffer:
             if since.tzinfo is not None:
                 since = since.astimezone(UTC).replace(tzinfo=None)
             query = query.where(Interaction.created_at > since)
-        query = query.order_by(Interaction.created_at, Interaction.id)
+        # SQLModel types class-level field access as the field's Python type
+        # (datetime) rather than the SQLAlchemy column expression it actually
+        # is at runtime; order_by needs the latter.
+        query = query.order_by(Interaction.created_at, Interaction.id)  # type: ignore[arg-type]
         if limit is not None:
             query = query.limit(limit)
         async with AsyncSession(self._engine) as session:
@@ -149,6 +154,29 @@ class InteractionBuffer:
             }
             for r in rows
         ]
+
+    async def get_watermark(self) -> datetime | None:
+        """Timestamp of the last interaction consumed by a successful
+        training cycle; None before the first cycle."""
+        await self._ensure_ready()
+        async with AsyncSession(self._engine) as session:
+            row = await session.get(TrainingState, _WATERMARK_KEY)
+        return datetime.fromisoformat(row.value) if row is not None else None
+
+    async def set_watermark(self, timestamp: datetime) -> None:
+        """Advance the watermark; persisted in the same database so restarts
+        never re-train on already-consumed data."""
+        await self._ensure_ready()
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.astimezone(UTC).replace(tzinfo=None)
+        async with AsyncSession(self._engine) as session:
+            row = await session.get(TrainingState, _WATERMARK_KEY)
+            if row is None:
+                row = TrainingState(key=_WATERMARK_KEY, value=timestamp.isoformat())
+            else:
+                row.value = timestamp.isoformat()
+            session.add(row)
+            await session.commit()
 
     async def aclose(self) -> None:
         if self._engine is not None:

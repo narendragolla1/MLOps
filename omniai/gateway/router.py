@@ -108,10 +108,12 @@ class GatewayRouter:
         self.app.middleware("http")(request_id_middleware())
 
         if self.engine is not None:
-            self.engine.on_usage = lambda prompt, completion: (
-                metrics.tokens.labels("prompt").inc(prompt),
-                metrics.tokens.labels("completion").inc(completion),
-            )
+
+            def _record_usage(prompt: int, completion: int) -> None:
+                metrics.tokens.labels("prompt").inc(prompt)
+                metrics.tokens.labels("completion").inc(completion)
+
+            self.engine.on_usage = _record_usage
 
         @self.app.get("/metrics")
         async def metrics_endpoint() -> Any:

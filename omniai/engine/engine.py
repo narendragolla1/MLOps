@@ -1,13 +1,15 @@
 """ModelEngine: factory facade over the serving backends.
 
 The engine owns the backend subprocess lifecycle and exposes a single async
-OpenAI-compatible client interface (``chat``) plus dynamic LoRA hot-swapping,
-so the rest of the framework never touches backend-specific details.
+OpenAI-compatible client interface (``chat``) plus a managed LoRA lifecycle
+(load / unload / activate / rollback via :class:`LoRARegistry`), so the rest
+of the framework never touches backend-specific details.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -15,6 +17,7 @@ import httpx
 
 from omniai.engine.backends import ADAPTERS, BackendAdapter
 from omniai.engine.config import EngineConfig
+from omniai.engine.lora import LoRARegistry
 from omniai.engine.resilience import (
     CircuitBreaker,
     EngineSupervisor,
@@ -27,12 +30,16 @@ from omniai.telemetry import traced_span
 class ModelEngine:
     """Unified serving facade. Create via :meth:`ModelEngine.create`."""
 
-    def __init__(self, config: EngineConfig, adapter: BackendAdapter):
+    def __init__(
+        self,
+        config: EngineConfig,
+        adapter: BackendAdapter,
+        lora_registry: LoRARegistry | None = None,
+    ):
         self.config = config
         self.adapter = adapter
         self.system_prompt: str | None = None
-        self.active_lora: str | None = None
-        self.active_lora_path: str | None = None
+        self.lora = lora_registry or LoRARegistry()
         self.breaker = CircuitBreaker(
             failure_threshold=config.breaker_failure_threshold,
             reset_timeout=config.breaker_reset_s,
@@ -51,15 +58,31 @@ class ModelEngine:
             self._semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
         return self._semaphore
 
+    @property
+    def active_lora(self) -> str | None:
+        return self.lora.active
+
+    @property
+    def active_lora_path(self) -> str | None:
+        if self.lora.active is None:
+            return None
+        record = self.lora.loaded.get(self.lora.active)
+        return record.path if record is not None else None
+
     @classmethod
-    def create(cls, config: EngineConfig | dict[str, Any]) -> ModelEngine:
+    def create(
+        cls,
+        config: EngineConfig | dict[str, Any],
+        *,
+        lora_registry: LoRARegistry | None = None,
+    ) -> ModelEngine:
         """Factory: build the engine with the adapter for ``config.backend``."""
         if isinstance(config, dict):
             config = EngineConfig(**config)
-        adapter_cls = ADAPTERS.get(config.backend.value)
+        adapter_cls = ADAPTERS.get(config.backend_name)
         if adapter_cls is None:
             raise ValueError(f"Unknown backend: {config.backend}")
-        return cls(config, adapter_cls(config))
+        return cls(config, adapter_cls(config), lora_registry=lora_registry)
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -90,7 +113,7 @@ class ModelEngine:
             if not ready:
                 self.adapter.stop()
                 raise EngineUnavailable(
-                    f"{self.config.backend.value} server did not become ready within {timeout}s"
+                    f"{self.config.backend_name} server did not become ready within {timeout}s"
                 )
         if supervise:
             self.supervisor = EngineSupervisor(self)
@@ -105,6 +128,29 @@ class ModelEngine:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+    async def health(self) -> dict[str, Any]:
+        """Liveness of the managed process and the HTTP endpoint."""
+        server_ok = False
+        try:
+            resp = await self.client.get("/health")
+            server_ok = resp.status_code == 200
+        except httpx.HTTPError:
+            pass
+        return {
+            "process": self.adapter.is_alive(),
+            "server": server_ok,
+            "active_lora": self.active_lora,
+        }
+
+    async def warmup(self) -> bool:
+        """One tiny generation so CUDA graphs/caches are primed before real
+        traffic; returns False instead of raising on failure."""
+        try:
+            await self.chat_text([{"role": "user", "content": "ping"}], max_tokens=1)
+            return True
+        except (httpx.HTTPError, KeyError, EngineUnavailable):
+            return False
 
     async def _post(self, path: str, payload: dict[str, Any]) -> httpx.Response:
         """POST with retry + circuit breaker; raises EngineUnavailable when down."""
@@ -156,7 +202,7 @@ class ModelEngine:
             **kwargs,
         }
         with traced_span(
-            "engine.chat", {"model": payload["model"], "backend": self.config.backend.value}
+            "engine.chat", {"model": payload["model"], "backend": self.config.backend_name}
         ) as span:
             resp = await self._post("/v1/chat/completions", payload)
             data = resp.json()
@@ -193,19 +239,65 @@ class ModelEngine:
                 chunk = line.removeprefix("data:").strip()
                 if chunk == "[DONE]":
                     break
-                import json
-
                 delta = json.loads(chunk)["choices"][0].get("delta", {})
                 if content := delta.get("content"):
                     yield content
 
+    # -- LoRA lifecycle -------------------------------------------------------
+
     async def load_lora_adapter(self, name: str, path: str, activate: bool = True) -> bool:
-        """Hot-swap a LoRA adapter into the running server, zero downtime."""
+        """Load an adapter into the running server, zero downtime.
+
+        When the server's adapter slots (``config.max_loras``) are full, the
+        oldest loaded adapter that is neither active nor the rollback target
+        is evicted first, so the continuous-learning loop never stalls on a
+        full server.
+        """
+        victim = self.lora.eviction_candidate(self.config.max_loras)
+        if victim is not None:
+            await self.unload_lora_adapter(victim)
         endpoint = self.adapter.lora_load_endpoint()
         payload = self.adapter.lora_load_payload(name, path)
         with traced_span("engine.load_lora", {"adapter": name}):
             await self._post(endpoint, payload)
+        self.lora.register(name, path)
         if activate:
-            self.active_lora = name
-            self.active_lora_path = path
+            self.lora.activate(name)
+        return True
+
+    def activate_lora(self, name: str) -> None:
+        """Make an already-loaded adapter the one served by default."""
+        self.lora.activate(name)
+
+    async def unload_lora_adapter(self, name: str) -> bool:
+        """Remove an adapter from the server and the registry."""
+        endpoint = self.adapter.lora_unload_endpoint()
+        payload = self.adapter.lora_unload_payload(name)
+        with traced_span("engine.unload_lora", {"adapter": name}):
+            await self._post(endpoint, payload)
+        self.lora.remove(name)
+        return True
+
+    async def rollback_lora(self) -> str | None:
+        """Reactivate the previously active adapter (or the base model).
+
+        Returns the adapter now active, or None when back on the base model.
+        The rolled-back-from adapter stays loaded, so rolling forward again
+        is equally cheap.
+        """
+        target = self.lora.previous
+        if target is None:
+            self.lora.deactivate()
+            return None
+        self.lora.activate(target)
+        return target
+
+    async def reapply_active_lora(self) -> bool:
+        """Re-load the registry's active adapter into a restarted server."""
+        if self.lora.active is None:
+            return False
+        record = self.lora.loaded[self.lora.active]
+        endpoint = self.adapter.lora_load_endpoint()
+        payload = self.adapter.lora_load_payload(record.name, record.path)
+        await self._post(endpoint, payload)
         return True

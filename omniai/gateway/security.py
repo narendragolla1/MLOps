@@ -14,7 +14,7 @@ import time
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from starlette.websockets import WebSocket
 
 from omniai.settings import OmniSettings
@@ -87,7 +87,7 @@ class BodyLimitMiddleware:
             return
         received = 0
 
-        async def limited_receive() -> dict:
+        async def limited_receive() -> Message:
             nonlocal received
             message = await receive()
             if message["type"] == "http.request":

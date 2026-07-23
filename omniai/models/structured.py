@@ -9,7 +9,7 @@ up to ``max_retries`` times before raising.
 from __future__ import annotations
 
 import json
-from typing import Any, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
@@ -34,7 +34,7 @@ def _extract_json(text: str) -> str:
     return text
 
 
-class StructuredOutput:
+class StructuredOutput(Generic[T]):
     """Callable wrapper returning validated ``schema`` instances."""
 
     def __init__(self, model: ChatModel, schema: type[T], max_retries: int = 2):

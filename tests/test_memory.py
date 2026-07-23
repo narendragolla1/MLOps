@@ -68,6 +68,21 @@ async def test_buffer_threshold_trigger(tmp_path):
     buffer.close()
 
 
+async def test_watermark_defaults_to_none_and_round_trips(tmp_path):
+    import datetime as dt
+
+    buffer = InteractionBuffer(tmp_path / "log.db")
+    assert await buffer.get_watermark() is None
+    stamp = dt.datetime(2026, 6, 1, 8, 30, 0)
+    await buffer.set_watermark(stamp)
+    assert await buffer.get_watermark() == stamp
+    # Advancing again overwrites rather than duplicating the row.
+    later = dt.datetime(2026, 6, 2, 9, 0, 0)
+    await buffer.set_watermark(later)
+    assert await buffer.get_watermark() == later
+    buffer.close()
+
+
 # -- training pair formatting ----------------------------------------------
 
 
@@ -187,7 +202,9 @@ async def test_eval_gate_rejects_bad_adapter(tmp_path):
     learner = ContinuousLearner(buffer, trainer, engine=engine, evaluator=lambda name, path: False)
     report = await learner.run_cycle()
     assert report["status"] == "rejected"
-    assert engine.swaps == []
+    # Shadow gate: loaded invisibly for scoring, but never left active.
+    assert len(engine.swaps) == 1
+    assert engine.swaps[0][0] == report["adapter"]
     buffer.close()
 
 

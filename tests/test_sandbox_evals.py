@@ -149,8 +149,16 @@ async def test_learner_rejects_via_gate_end_to_end(tmp_path):
         {"base:weather in Paris?": GOOD, "base:search for llamas": SEARCH}
         # candidate adapter answers nothing correctly -> accuracy 0
     )
-    swaps = []
-    engine.load_lora_adapter = lambda *a, **k: swaps.append(a)  # spy
+    loads, unloads = [], []
+
+    async def spy_load(name, path, activate=True):
+        loads.append((name, activate))
+
+    async def spy_unload(name):
+        unloads.append(name)
+
+    engine.load_lora_adapter = spy_load
+    engine.unload_lora_adapter = spy_unload
 
     buffer = InteractionBuffer(tmp_path / "log.db")
     await buffer.log(OmniMessage(content="q", role=Role.USER, session_id="s"))
@@ -166,5 +174,8 @@ async def test_learner_rejects_via_gate_end_to_end(tmp_path):
     report = await learner.run_cycle()
     assert report["status"] == "rejected"
     assert report["reason"] == "failed_eval_gate"
-    assert swaps == []
+    # Shadow gate: loaded invisibly for scoring, never activated, then purged.
+    assert loads == [(report["adapter"], False)]
+    assert unloads == [report["adapter"]]
+    assert engine.active_lora is None
     buffer.close()

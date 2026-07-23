@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlmodel import Field, SQLModel
 
 
-class Interaction(SQLModel, table=True):  # type: ignore[call-arg]
+class Interaction(SQLModel, table=True):
     __tablename__ = "interactions"
 
     id: str = Field(primary_key=True)
@@ -25,3 +25,17 @@ class Interaction(SQLModel, table=True):  # type: ignore[call-arg]
     # "metadata" is reserved by SQLModel/SQLAlchemy, hence the _json suffix.
     metadata_json: str = "{}"
     created_at: datetime = Field(index=True)
+
+
+class TrainingState(SQLModel, table=True):
+    """Small key/value store for continuous-learning bookkeeping.
+
+    Holds the incremental-training watermark (the timestamp of the last
+    interaction consumed by a successful cycle) so a restarted process never
+    re-trains on already-consumed data.
+    """
+
+    __tablename__ = "training_state"
+
+    key: str = Field(primary_key=True)
+    value: str

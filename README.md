@@ -38,10 +38,12 @@ python examples/basic_agent.py    # full pipeline in < 50 lines
 | Module | Purpose |
 | --- | --- |
 | `omniai.protocol` | Canonical `OmniMessage` flowing through every layer |
-| `omniai.engine` | `ModelEngine` factory over vLLM/SGLang subprocesses; maps `quantization="fp8"`, `tensor_parallel_size=2`, etc. to backend CLI flags; OpenAI-compatible async client; dynamic LoRA hot-swap |
+| `omniai.engine` | `ModelEngine` factory over vLLM/SGLang subprocesses; maps `quantization="fp8"`, `tensor_parallel_size=2`, `devices=[0,1]`, etc. to backend CLI flags and env; OpenAI-compatible async client with circuit breaker + retries + backpressure; persistent `LoRARegistry` lifecycle (load/unload/rollback/reapply with slot eviction); pluggable backends via `register_backend` — see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) |
 | `omniai.graph` | LangGraph-style builder: Pydantic `State`, sync/async nodes, lambda conditional edges, bounded cycles, `@tool` decorator generating JSON Schema from type hints |
 | `omniai.gateway` | `GatewayRouter` (FastAPI) with REST, WebSocket, and Discord adapters; interceptor + observer pipeline |
-| `omniai.memory` | `skill.md` ingestion into a pre-cached system prompt (RadixAttention-friendly), async SQLite `InteractionBuffer`, background `LoRATrainer` + `ContinuousLearner` cycle |
+| `omniai.rag` | Factual knowledge layer: `VectorStore` contract with dependency-free `InMemoryVectorStore`/`HashEmbedder`, PDF-style chunked ingestion, grounding `Retriever` — facts are retrieved, never trained into weights |
+| `omniai.tenancy` | Multi-tenant agents on one base model: `AgentProfile` (LoRA = behavior, retriever = facts), `AgentRegistry`, `TenantHandler` routing each request to its agent's LoRA — see [docs/COMPOUND_AI.md](docs/COMPOUND_AI.md) |
+| `omniai.memory` | `skill.md` ingestion into a pre-cached system prompt (RadixAttention-friendly), async `InteractionBuffer` (Postgres/SQLite) with a persisted training watermark, `InteractionJudge` LLM-as-a-judge curation, `RehearsalBuffer` golden-data mixing, background `LoRATrainer` + `ContinuousLearner` cycle with a shadow gate |
 | `omniai.guardrails` | `PromptGuard` interceptor: prompt-injection blocking, PII redaction |
 | `omniai.telemetry` | OpenTelemetry spans (token counts, latency) with a no-dependency fallback recorder |
 | `omniai.sandbox` | `SandboxExecution`: LLM-generated Python/Bash in a locked-down, ephemeral Docker container |
@@ -56,14 +58,17 @@ from omniai.engine import ModelEngine
 
 engine = ModelEngine.create({
     "model": "Qwen/Qwen2.5-7B-Instruct",
-    "backend": "vllm",              # or "sglang"
+    "backend": "vllm",              # or "sglang", or a register_backend() plugin
     "quantization": "fp8",
     "kv_cache": "paged_attention",
     "tensor_parallel_size": 2,
+    "devices": [0, 1],              # GPU placement -> CUDA_VISIBLE_DEVICES
+    "log_dir": "logs",              # capture server stdout/stderr
 })
-await engine.start()                 # launches the server subprocess
+await engine.start(supervise=True)    # launches the server subprocess + watchdog
 text = await engine.chat_text([{"role": "user", "content": "hi"}])
 await engine.load_lora_adapter("skills-v2", "/adapters/skills-v2")  # zero downtime
+await engine.rollback_lora()          # previous adapter stays loaded — instant revert
 ```
 
 ### Build an agent graph
@@ -96,6 +101,33 @@ gate = AdapterGate(engine, GoldenDataset.from_jsonl("golden.jsonl"))
 learner = ContinuousLearner(buffer, LoRATrainer(engine.config.model),
                             engine=engine, evaluator=gate.evaluator)
 buffer.on_threshold = learner.trigger   # train + eval + hot-swap at threshold
+```
+
+### Multi-tenant agents with RAG, curation, and rehearsal
+
+```python
+from omniai.rag import InMemoryVectorStore, Retriever
+from omniai.tenancy import AgentProfile, AgentRegistry, TenantHandler
+from omniai.memory import InteractionJudge, RehearsalBuffer, ContinuousLearner
+
+store = InMemoryVectorStore()
+store.add_texts(["The Widget Pro costs $49 and ships in blue or red."])
+
+registry = AgentRegistry(default="assistant")
+registry.register(AgentProfile(
+    name="sales", lora="sales-lora-v3",
+    system_prompt="You are an enthusiastic sales assistant.",
+    retriever=Retriever(store),          # facts, retrieved — never trained into weights
+))
+handler = TenantHandler(registry, engine)  # routes each request to its agent's LoRA
+
+judge = InteractionJudge(engine=judge_engine, min_score=0.7)   # anti-poisoning
+rehearsal = RehearsalBuffer.from_jsonl("golden.jsonl")          # anti-forgetting
+learner = ContinuousLearner(
+    buffer, LoRATrainer(engine.config.model), engine=engine,
+    evaluator=gate.evaluator,   # shadow-gated: scored before it ever goes live
+    curator=judge.curate, rehearsal=rehearsal,
+)
 ```
 
 ## LangChain-style building blocks

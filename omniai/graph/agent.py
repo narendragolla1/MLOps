@@ -79,9 +79,11 @@ def create_tool_agent(
         return END
 
     graph = Graph(AgentState)
-    graph.add_node("model", call_model)
-    graph.add_node("tools", run_tools)
+    # Graph isn't generic over the state type, so mypy can't see that these
+    # nodes' narrower AgentState parameter is the same one passed above.
+    graph.add_node("model", call_model)  # type: ignore[arg-type]
+    graph.add_node("tools", run_tools)  # type: ignore[arg-type]
     graph.set_entry_point("model")
-    graph.add_conditional_edges("model", route)
+    graph.add_conditional_edges("model", route)  # type: ignore[arg-type]
     graph.add_edge("tools", "model")
     return graph.compile(max_iterations=2 * max_steps + 2)

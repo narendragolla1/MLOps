@@ -31,12 +31,15 @@ flowchart LR
 | [Integrations](integrations/index.md) | Model providers: [OpenAI](integrations/openai.md), [Anthropic](integrations/anthropic.md), and [self-hosted engines](integrations/self_hosted.md). |
 | [API reference](reference/index.md) | Hand-written reference for every public module. |
 | [Security](security.md) | Security model and how to report vulnerabilities. |
+| [Self-hosting deep-dive](../docs/SELF_HOSTING.md) | Design patterns behind the serving layer: LoRA lifecycle, GPU placement, retries/circuit-breaker, supervision. |
+| [Compound AI architecture](../docs/COMPOUND_AI.md) | Multi-tenancy, RAG, anti-poisoning curation, anti-forgetting rehearsal, and the shadow-gated learning loop. |
 
 ## What can you build?
 
 - **Tool-calling agents** with any provider behind one `ChatModel` interface — see [Build an Agent](tutorials/build_an_agent.md).
 - **Multi-channel assistants** served over REST, WebSockets, and Discord from a single graph — see [Multi-channel chatbot](tutorials/multi_channel_chatbot.md).
 - **Self-improving deployments** where interaction logs become LoRA adapters, gated by golden-dataset evals and hot-swapped live — see [Continuous learning](tutorials/continuous_learning.md).
+- **Multi-tenant business-unit agents** sharing one GPU, each with its own LoRA (behavior) and RAG store (facts), curated and rehearsed against catastrophic forgetting — see [Compound AI architecture](../docs/COMPOUND_AI.md).
 
 ## Design principles
 
