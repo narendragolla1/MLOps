@@ -203,7 +203,78 @@ No chat template (`<|im_start|>` etc. for the Qwen model in the example), no EOS
 
 ---
 
-## 6. Prioritized roadmap
+## 6. Self-hosted LLM deep-dive: the serving stack end-to-end
+
+This is the framework's boldest promise — own the vLLM/SGLang lifecycle so users never touch backend details — and it is where the gap between the abstraction and real GPU operations is widest. Walking the actual self-hosted pipeline stage by stage:
+
+### 6.1 Boot: model acquisition and readiness
+
+- `vllm serve Qwen/Qwen2.5-7B-Instruct` downloads ~15 GB from Hugging Face on first boot. The adapter neither pre-fetches, configures `HF_HOME`/`HF_TOKEN` (gated models simply fail), nor scales the readiness timeout to download size — the default 300 s (`engine.py:45`) is routinely exceeded on first boot, and with stdout/stderr → DEVNULL (`backends.py:53-57`) the operator sees only "server did not become ready", not "downloading shard 3/8".
+- **`subprocess.Popen` is called with no `env=`** (`backends.py:53`). Consequences:
+  - `CUDA_VISIBLE_DEVICES` cannot be set per engine — two engines on one host fight over GPU 0;
+  - **vLLM's dynamic LoRA endpoint is disabled by default**: `/v1/load_lora_adapter` requires `VLLM_ALLOW_RUNTIME_LORA_UPDATING=True` in the *server's* environment. The adapter never sets it, so on a stock vLLM the advertised "zero-downtime hot-swap" (`engine.py:131-140`) is rejected by the server — the continuous-learning loop is broken at the serving layer independently of bug 1.1.
+- `/health` returning 200 does not mean *warm*: CUDA graph capture and cache priming make the first real request pay seconds of latency. There is no warm-up generation after readiness.
+- No port-collision or GPU-availability preflight: `tensor_parallel_size=2` on a 1-GPU box, or a port already bound, both die invisibly in DEVNULL.
+
+### 6.2 Hardware-optimization mapping is thinner than it looks
+
+- `quantization` is a free string. AWQ/GPTQ require *pre-quantized checkpoints* — passing `quantization="awq"` with the fp16 Qwen checkpoint from the README crashes the server at load. FP8 is coupled to `--kv-cache-dtype fp8` unconditionally (`backends.py:96-97`), which is a policy decision (accuracy trade-off) the user never asked for and cannot opt out of.
+- **The promised prefix-cache win is never switched on for vLLM.** `SkillLoader.install` + `set_system_prompt` are documented as "prefilled once and served from cache" (`skills.py:14-17`), but the vLLM adapter never passes `--enable-prefix-caching` — on vLLM's V0 engine (which `vllm>=0.5.0` permits) automatic prefix caching is **off by default**, so every request re-prefills the full skill prompt. The claimed RadixAttention benefit is real only on SGLang.
+- Version drift is unmanaged: `vllm>=0.5.0` and `sglang>=0.3.0` (`pyproject.toml:22-23`) span years of releases in which these exact CLI flags and LoRA endpoints were added, renamed, or gated. The adapters hardcode flag spellings with no version detection and no startup verification that the flags exist — the failure mode is, again, a silent DEVNULL crash.
+- No mapping for the knobs that matter most in self-hosted throughput tuning: `max_num_seqs`/`max-running-requests` (batch concurrency), dtype, seed, `swap-space`, pipeline parallelism, `served-model-name`.
+
+### 6.3 LoRA lifecycle: load-only, capped at 4, no rollback
+
+- `--max-loras 4` is **hardcoded** (`backends.py:109`). The continuous learner mints a new adapter every cycle (`...-lora-v1`, `-v2`, …) and there is **no unload path anywhere in the abstraction** — `BackendAdapter` defines `lora_load_endpoint` but no unload, and `ModelEngine` has no `unload_lora_adapter`. Adapters accumulate in the server until the cap/GPU memory is hit, at which point every subsequent cycle fails. The system's core loop has a built-in expiry of ~4 cycles.
+- **No rollback:** after a bad swap there is no "reactivate previous adapter" operation and no record of what was previously active (`active_lora` is overwritten in place, `engine.py:139`). Combined with the broken gate (1.1), a regressing adapter goes live with no way back short of a restart.
+- **Activation is a client-side fiction.** `active_lora` only changes which `model` string *this one `ModelEngine` instance* sends (`engine.py:83`). Any other client of the same server — a second gateway replica, the eval gate mid-flight, a monitoring probe — still gets the base model or its own idea of the adapter. There is no server-side notion of "the production adapter", no alias/routing table, and no atomicity: requests in flight during a swap straddle two models within one session.
+- Adapter artifacts are **local filesystem paths** handed to the server (`load_lora_adapter(name, path)`): this silently assumes trainer and inference server share a filesystem. The moment serving runs in a container or on another node (i.e., any real deployment), the path is meaningless. Self-hosted MLOps needs an artifact store (S3/NFS) plus a registry mapping adapter name → version → artifact → eval verdict; none exists (the `history` list on the learner is in-memory and unshared).
+
+### 6.4 Training and serving fight for the same GPU
+
+`LoRATrainer` defaults to a `ProcessPoolExecutor` **on the same host** (`learning.py:119-121`), and `_default_peft_train` loads the full base model for SFT. Meanwhile vLLM has pre-allocated ~90% of GPU memory (its default `gpu_memory_utilization`). The default topology of the flagship feature is therefore: *serving holds the GPU, training OOMs* — or, if the box has spare GPUs, training grabs GPU 0 alongside vLLM anyway because nobody sets `CUDA_VISIBLE_DEVICES` (6.1). There is no device placement, no training queue, no option to schedule training off-peak or on a separate node. For a credible self-hosted story, training must be a dispatchable job (separate worker/node, or at minimum an explicit device map and admission check), not an in-process pool.
+
+### 6.5 Request path: no token budgeting, no admission control, no streaming out
+
+- **Nothing counts tokens.** The skill prompt is unbounded (`compose_system_prompt` concatenates every skill), conversation state is append-only (3), and `max_model_len` is never checked client-side — once a session's history exceeds the context window, every subsequent request 400s forever (a permanently bricked session, since history is never truncated). A tokenizer-aware budget (truncate/summarize to fit `max_model_len` minus generation headroom) is table stakes for self-hosted serving where *you* chose the context length.
+- The gateway accepts unbounded concurrency and funnels it into one httpx client with a flat 120 s timeout; the server's real capacity (`max_num_seqs`, KV-cache pressure) is invisible because **vLLM's `/metrics` (queue depth, KV-cache utilization, TTFT) is never scraped** — the framework flies blind past the exact signals self-hosting exists to expose. No queueing, no load shedding, no per-session limits.
+- `stream_chat` exists but no gateway route uses it, so self-hosted TTFT advantages are thrown away; eval-gate traffic also shares the production server (no shadow/offline eval path), so every learning cycle degrades live latency.
+
+### 6.6 Shutdown and supervision of GPU processes
+
+- `stop()` sends SIGTERM to the *parent* process only (`backends.py:60-67`). With `tensor_parallel_size>1`, vLLM spawns worker processes (multiprocessing/Ray) holding NCCL communicators; killing the parent can orphan workers that **keep GPU memory allocated**, wedging the GPU until manual cleanup. The subprocess should be started in its own process group (`start_new_session=True`) and killed with `killpg`, with a post-mortem check that GPU memory was actually released.
+- There is no supervision loop: if the server OOMs or segfaults mid-run (routine events in GPU serving), `self.process` still holds a dead PID, `/health` on the gateway still says "ok" (3), and every request 500s until a human intervenes. A restart policy with crash-loop backoff — and re-loading the previously active adapter after restart (which requires the registry from 6.3) — is the minimum viable supervisor.
+
+### 6.7 What a credible self-hosted E2E pipeline needs (target architecture)
+
+```
+            ┌────────────┐   scrape /metrics   ┌───────────────┐
+ clients ──▶│  Gateway    │◀───────────────────│  Supervisor    │
+            │ (auth, SSE, │                     │ (restart, warm │
+            │  admission) │                     │  -up, GPU mem) │
+            └─────┬──────┘                     └───────┬───────┘
+                  ▼ token-budgeted requests            ▼ owns lifecycle
+            ┌────────────────────────────────────────────────┐
+            │  vLLM / SGLang  (env-configured, pinned flags)  │
+            │  adapter alias table: "prod" → skills-v7        │
+            └───────────────▲────────────────────────────────┘
+                            │ load/unload/activate via registry
+            ┌───────────────┴───────────────┐
+            │  Adapter Registry (DB + S3)    │◀── eval verdicts (shadow eval,
+            │  name → version → artifact     │    temperature=0, base baseline)
+            └───────────────▲───────────────┘
+                            │ artifact push
+            ┌───────────────┴───────────────┐
+            │  Training worker (own GPU/node,│◀── watermarked batches from
+            │  chat-template SFT, queued)    │    interaction store
+            └───────────────────────────────┘
+```
+
+The current codebase has the right *interfaces* for roughly half of these boxes; the missing pieces are the registry, the supervisor, device placement, token budgeting, and metrics-driven admission — detailed in the roadmap below.
+
+---
+
+## 7. Prioritized roadmap
 
 ### P0 — correctness & safety (do before any real traffic)
 1. Fix eval ordering: load adapter (inactive) → score → activate or unload (1.1).
@@ -212,19 +283,25 @@ No chat template (`<|im_start|>` etc. for the Qwen model in the example), no EOS
 4. Add authentication (API keys/JWT dependency in FastAPI), rate limiting, and Discord Ed25519 verification + PING handshake (2.1, 2.2).
 5. Watermark training data; persist trainer version; make threshold accounting transactional and post-success (1.4, 1.10).
 6. Pin the eval gate: explicit base-model baseline, `temperature=0`, load-then-score (1.5).
+7. **Serving-layer unblockers for the learning loop:** pass an `env` dict through `BackendAdapter.start()` (set `VLLM_ALLOW_RUNTIME_LORA_UPDATING`, `CUDA_VISIBLE_DEVICES`, `HF_HOME`); add `unload_lora_adapter` + previous-adapter tracking for rollback; make `--max-loras` configurable and evict old adapters each cycle (6.1, 6.3).
+8. Capture backend stdout/stderr to files/logger and kill the whole process group on `stop()` (`start_new_session=True` + `killpg`) so TP workers can't wedge the GPU (6.1, 6.6).
 
 ### P1 — reliability & the missing product core
-7. Session memory: `as_handler` hydrates State from the buffer by `session_id` (with a window/summarization policy).
-8. Ship a `ToolRegistry` + prebuilt `ToolNode`/agent loop; adopt native `tools=` + guided decoding; fix `to_openai` to carry `tool_calls`/`tool_call_id`.
-9. Engine resilience: retries with backoff + jitter, circuit breaker, health-aware `/health`, subprocess log capture + supervision/restart, graceful shutdown via FastAPI lifespan.
-10. Move observers off the request path (`asyncio.create_task` + bounded queue); log blocked messages to an audit table pre-redaction (encrypted).
-11. Correct SFT formatting: chat template + EOS + completion-only loss; add data quality filters (dedup, self-output exclusion, feedback signal).
+9. Session memory: `as_handler` hydrates State from the buffer by `session_id` — with a **tokenizer-aware budget** that truncates/summarizes to fit `max_model_len` (6.5).
+10. Ship a `ToolRegistry` + prebuilt `ToolNode`/agent loop; adopt native `tools=` + guided decoding (vLLM `guided_json` / SGLang structured output — a self-hosting advantage the framework currently ignores); fix `to_openai` to carry `tool_calls`/`tool_call_id`.
+11. Engine resilience: retries with backoff + jitter, circuit breaker, health-aware `/health` that probes the backend, a supervisor with crash-loop backoff that re-loads the active adapter after restart, warm-up generation after readiness, graceful shutdown via FastAPI lifespan (6.1, 6.6).
+12. Serving correctness: enable `--enable-prefix-caching` on vLLM (or verify V1 default) so the skill-prompt caching claim is real; validate `quantization` against checkpoint format; decouple the forced fp8 KV-cache; pin and version-detect backend flags (6.2).
+13. Move training off the serving GPU: explicit device placement at minimum, a queued training worker (separate process with its own `CUDA_VISIBLE_DEVICES`, or separate node) as the default topology (6.4).
+14. Move observers off the request path (`asyncio.create_task` + bounded queue); log blocked messages to an audit table pre-redaction (encrypted).
+15. Correct SFT formatting: chat template + EOS + completion-only loss; add data quality filters (dedup, self-output exclusion, feedback signal).
 
 ### P2 — scale-out
-12. Externalize coordination state (Postgres/Redis): buffer behind a real repository interface, adapter registry with versioned activation, distributed threshold/locking so N replicas work.
-13. Expose streaming end-to-end (SSE on REST, frames on WS); admission control and per-session concurrency limits.
-14. Data governance: retention TTL, consent flags, erasure path for training data.
-15. CI (pytest + ruff + mypy), Dockerfile, pinned lockfile, config from environment.
+16. Adapter registry + artifact store (DB + S3/NFS): name → version → artifact → eval verdict, server-side "prod" alias for atomic activation across replicas, rollback as a first-class operation (6.3, 6.7).
+17. Externalize coordination state (Postgres/Redis): buffer behind a real repository interface, distributed threshold/locking so N replicas work.
+18. Metrics-driven operation: scrape vLLM/SGLang `/metrics` (KV-cache utilization, queue depth, TTFT) into telemetry; admission control and load shedding keyed to it; per-session concurrency limits (6.5).
+19. Expose streaming end-to-end (SSE on REST, frames on WS) to bank the self-hosted TTFT advantage; separate shadow-eval path so gate traffic doesn't share the production server (6.5).
+20. Data governance: retention TTL, consent flags, erasure path for training data.
+21. CI (pytest + ruff + mypy), Dockerfile with pinned backend versions, config from environment.
 
 ---
 
