@@ -59,8 +59,12 @@ ignore = [
     "SIM117",  # nested with statements (kept for clarity in tests)
 ]
 
+[tool.ruff.format]
+# The demo intentionally trades formatting for its < 50-line budget.
+exclude = ["examples/basic_agent.py"]
+
 [tool.ruff.lint.per-file-ignores]
-"examples/*" = ["E402", "E501", "I001"]  # < 50-line demo favors compactness
+"examples/*" = ["E401", "E402", "E501", "I001"]  # < 50-line demo favors compactness
 "omniai/guardrails/middleware.py" = ["E501"]  # regex patterns read better unwrapped
 "tests/*" = ["B023"]  # loop-scoped closures in parametrized-by-hand loops
 
