@@ -1,121 +1,153 @@
-"""Interaction buffer: async SQL logging of every message through the gateway.
+"""Interaction buffer: async, database-agnostic logging of gateway traffic.
+
+Backed by SQLModel over SQLAlchemy's async engine, so the storage backend is
+selected purely by URL — ``postgresql+asyncpg://`` in production,
+``sqlite+aiosqlite://`` for zero-config dev, or any other async dialect.
+Plain file paths are accepted for backward compatibility and treated as
+SQLite databases.
 
 Designed to be attached as a GatewayRouter observer — it receives every
-inbound user message, tool output, and LLM response. SQLite writes run in a
-worker thread so the event loop never blocks; the schema is plain SQL so a
-Postgres DSN can back the same interface later.
+inbound user message, tool output, and LLM response without blocking the
+event loop.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
-import threading
+from datetime import timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlmodel import SQLModel, select
+from sqlmodel.ext.asyncio.session import AsyncSession
+
+from omniai.memory.models import Interaction
 from omniai.protocol import OmniMessage
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS interactions (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    channel TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    tool_calls TEXT NOT NULL DEFAULT '[]',
-    metadata TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions (session_id, created_at);
-"""
+
+def _to_url(target: str | Path) -> str:
+    target = str(target)
+    if "://" in target:
+        return target
+    return f"sqlite+aiosqlite:///{target}"
 
 
 class InteractionBuffer:
-    """Async-friendly interaction log with a training-trigger threshold."""
+    """Async interaction log with a training-trigger threshold."""
 
     def __init__(
         self,
-        db_path: str | Path = "interactions.db",
+        database_url: str | Path = "sqlite+aiosqlite:///interactions.db",
         threshold: int | None = None,
         on_threshold: Callable[[], Awaitable[Any] | Any] | None = None,
     ):
-        self.db_path = str(db_path)
+        self.database_url = _to_url(database_url)
         self.threshold = threshold
         self.on_threshold = on_threshold
-        self._lock = threading.Lock()
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.executescript(_SCHEMA)
-        self._conn.commit()
-        self._threshold_fired_at = self._count_sync()
+        self._engine: AsyncEngine | None = None
+        self._ready_lock = asyncio.Lock()
+        self._threshold_fired_at: int | None = None
 
-    # -- sync core (runs in worker threads) ---------------------------------
+    async def _ensure_ready(self) -> AsyncEngine:
+        if self._engine is None:
+            async with self._ready_lock:
+                if self._engine is None:
+                    engine = create_async_engine(self.database_url)
+                    async with engine.begin() as conn:
+                        await conn.run_sync(SQLModel.metadata.create_all)
+                    self._engine = engine
+        if self._threshold_fired_at is None:
+            self._threshold_fired_at = await self._count()
+        return self._engine
 
-    def _count_sync(self) -> int:
-        with self._lock:
-            (n,) = self._conn.execute("SELECT COUNT(*) FROM interactions").fetchone()
-        return n
+    async def _count(self) -> int:
+        from sqlalchemy import func
 
-    def _insert_sync(self, message: OmniMessage) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO interactions "
-                "(id, session_id, channel, role, content, tool_calls, metadata, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    message.id,
-                    message.session_id,
-                    message.channel.value,
-                    message.role.value,
-                    message.content,
-                    json.dumps([tc.model_dump() for tc in message.tool_calls]),
-                    json.dumps(message.metadata, default=str),
-                    message.created_at.isoformat(),
-                ),
-            )
-            self._conn.commit()
+        async with AsyncSession(self._engine) as session:
+            result = await session.exec(select(func.count()).select_from(Interaction))
+            return int(result.one())
 
-    def _fetch_sync(self, session_id: str | None, limit: int | None) -> list[dict[str, Any]]:
-        query = "SELECT * FROM interactions"
-        params: list[Any] = []
-        if session_id is not None:
-            query += " WHERE session_id = ?"
-            params.append(session_id)
-        query += " ORDER BY created_at ASC"
-        if limit is not None:
-            query += " LIMIT ?"
-            params.append(limit)
-        with self._lock:
-            self._conn.row_factory = sqlite3.Row
-            rows = self._conn.execute(query, params).fetchall()
-        return [dict(r) for r in rows]
-
-    # -- async API ----------------------------------------------------------
+    @staticmethod
+    def _to_row(message: OmniMessage) -> Interaction:
+        # Store naive UTC: portable across TIMESTAMP flavors (asyncpg rejects
+        # tz-aware values for TIMESTAMP WITHOUT TIME ZONE).
+        created = message.created_at
+        if created.tzinfo is not None:
+            created = created.astimezone(timezone.utc).replace(tzinfo=None)
+        return Interaction(
+            id=message.id,
+            session_id=message.session_id,
+            channel=message.channel.value,
+            role=message.role.value,
+            content=message.content,
+            tool_calls=json.dumps([tc.model_dump() for tc in message.tool_calls]),
+            metadata_json=json.dumps(message.metadata, default=str),
+            created_at=created,
+        )
 
     async def log(self, message: OmniMessage) -> None:
         """Persist a message; fires ``on_threshold`` when the bar is crossed."""
-        await asyncio.to_thread(self._insert_sync, message)
+        await self._ensure_ready()
+        async with AsyncSession(self._engine) as session:
+            await session.merge(self._to_row(message))
+            await session.commit()
         if self.threshold is None or self.on_threshold is None:
             return
-        count = await asyncio.to_thread(self._count_sync)
-        if count - self._threshold_fired_at >= self.threshold:
+        count = await self._count()
+        if count - (self._threshold_fired_at or 0) >= self.threshold:
             self._threshold_fired_at = count
             result = self.on_threshold()
             if asyncio.iscoroutine(result):
                 await result
 
     async def count(self) -> int:
-        return await asyncio.to_thread(self._count_sync)
+        await self._ensure_ready()
+        return await self._count()
 
     async def fetch(
         self, session_id: str | None = None, limit: int | None = None
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._fetch_sync, session_id, limit)
+        """Rows as plain dicts, oldest first (keys match the legacy schema)."""
+        await self._ensure_ready()
+        query = select(Interaction)
+        if session_id is not None:
+            query = query.where(Interaction.session_id == session_id)
+        query = query.order_by(Interaction.created_at, Interaction.id)
+        if limit is not None:
+            query = query.limit(limit)
+        async with AsyncSession(self._engine) as session:
+            rows = (await session.exec(query)).all()
+        return [
+            {
+                "id": r.id,
+                "session_id": r.session_id,
+                "channel": r.channel,
+                "role": r.role,
+                "content": r.content,
+                "tool_calls": r.tool_calls,
+                "metadata": r.metadata_json,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+    async def aclose(self) -> None:
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        """Sync-friendly close; schedules disposal if a loop is running."""
+        if self._engine is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self.aclose())
+        else:
+            loop.create_task(self.aclose())
 
     # Allows: GatewayRouter(observers=[buffer])
     async def __call__(self, message: OmniMessage) -> None:
