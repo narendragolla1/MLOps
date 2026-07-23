@@ -1,0 +1,75 @@
+name: omniai
+
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - path: .env
+        required: false  # variables may also come from the host environment
+    environment:
+      OMNIAI_DATABASE_URL: postgresql+asyncpg://omniai:${POSTGRES_PASSWORD:?set in .env}@postgres:5432/omniai
+      OMNIAI_ENGINE_BASE_URL: http://vllm:8000
+      OMNIAI_ENGINE_MANAGED: "false"
+    volumes:
+      - adapters:/home/omniai/adapters
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: omniai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: omniai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omniai -d omniai"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  vllm:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model
+      - ${OMNIAI_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - --enable-lora
+      - --max-loras
+      - "4"
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+      # Shared with the gateway so freshly trained LoRA adapters can be
+      # hot-swapped by path with zero downtime.
+      - adapters:/adapters
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      start_period: 300s
+      retries: 20
+    ipc: host
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  hf-cache:
+  adapters:

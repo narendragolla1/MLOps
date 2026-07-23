@@ -78,7 +78,7 @@ class GatewayRouter:
         self._register_routes()
         self._register_error_handlers()
         for hook in shutdown_hooks or []:
-            self.app.add_event_handler("shutdown", hook)
+            self.app.router.add_event_handler("shutdown", hook)
         if settings is not None:
             self._apply_observability(settings)
             self._apply_security(settings)

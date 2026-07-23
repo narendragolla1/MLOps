@@ -94,6 +94,25 @@ learner = ContinuousLearner(buffer, LoRATrainer(engine.config.model),
 buffer.on_threshold = learner.trigger   # train + eval + hot-swap at threshold
 ```
 
+## Production deployment (Docker Compose)
+
+The `deploy/` directory ships a production stack: the **gateway** (this app, non-root image with healthchecks), **Postgres** (interaction log), and **vLLM** (GPU serving container, sharing an `adapters` volume with the gateway so LoRA hot-swaps work by path).
+
+```bash
+cp deploy/.env.example deploy/.env   # set OMNIAI_API_KEYS + POSTGRES_PASSWORD
+docker compose -f deploy/docker-compose.yml up -d --build
+curl -H "X-API-Key: $KEY" localhost:8080/v1/messages -d '{"content":"hi"}'
+```
+
+Production behavior out of the box:
+
+- **Fail-closed auth** — the app refuses to boot without `OMNIAI_API_KEYS` (explicit `OMNIAI_AUTH_DISABLED=true` required to run open); per-key token-bucket rate limiting (429 + `Retry-After`), body-size caps, optional CORS.
+- **Reliability** — engine calls get retries with exponential backoff + jitter and a circuit breaker (fast 503s with `Retry-After` while the backend is down); managed engines are supervised and restarted with the active LoRA re-applied; graceful shutdown drains and disposes resources.
+- **Observability** — Prometheus `/metrics` (request counts/latency, token usage, breaker state, learning cycles), `/health/live` + `/health/ready` probes, structured JSON logs with `X-Request-ID` correlation, optional OTLP trace export (`OMNIAI_OTLP_ENDPOINT`).
+- **DB-agnostic persistence** — SQLModel over any SQLAlchemy async URL: Postgres in the compose stack, SQLite for zero-config dev, MySQL etc. unchanged.
+
+All configuration is environment-driven (`OMNIAI_*`, see `deploy/.env.example`); `omniai.app:create_app` is the container entrypoint factory.
+
 ## Optional extras
 
 ```bash
