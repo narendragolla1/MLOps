@@ -34,7 +34,7 @@ python examples/basic_agent.py    # full pipeline in < 50 lines
 | Module | Purpose |
 | --- | --- |
 | `omniai.protocol` | Canonical `OmniMessage` flowing through every layer |
-| `omniai.engine` | `ModelEngine` factory over vLLM/SGLang subprocesses; maps `quantization="fp8"`, `tensor_parallel_size=2`, etc. to backend CLI flags; OpenAI-compatible async client; dynamic LoRA hot-swap |
+| `omniai.engine` | `ModelEngine` factory over vLLM/SGLang subprocesses; maps `quantization="fp8"`, `tensor_parallel_size=2`, `devices=[0,1]`, etc. to backend CLI flags and env; OpenAI-compatible async client with retry policy + bulkhead admission; LoRA lifecycle (load/unload/rollback) via a persistent `LoRARegistry`; `EngineSupervisor` watchdog with crash-loop backoff; pluggable backends via `register_backend` — see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) |
 | `omniai.graph` | LangGraph-style builder: Pydantic `State`, sync/async nodes, lambda conditional edges, bounded cycles, `@tool` decorator generating JSON Schema from type hints |
 | `omniai.gateway` | `GatewayRouter` (FastAPI) with REST, WebSocket, and Discord adapters; interceptor + observer pipeline |
 | `omniai.memory` | `skill.md` ingestion into a pre-cached system prompt (RadixAttention-friendly), async SQLite `InteractionBuffer`, background `LoRATrainer` + `ContinuousLearner` cycle |
@@ -52,14 +52,23 @@ from omniai.engine import ModelEngine
 
 engine = ModelEngine.create({
     "model": "Qwen/Qwen2.5-7B-Instruct",
-    "backend": "vllm",              # or "sglang"
+    "backend": "vllm",              # or "sglang", or a register_backend() plugin
     "quantization": "fp8",
     "kv_cache": "paged_attention",
     "tensor_parallel_size": 2,
+    "devices": [0, 1],              # GPU placement -> CUDA_VISIBLE_DEVICES
+    "log_dir": "logs",              # capture server stdout/stderr
+    "max_concurrent_requests": 64,  # bulkhead admission
 })
-await engine.start()                 # launches the server subprocess
+await engine.start()                 # launches the server subprocess (own process group)
+await engine.warmup()                # prime CUDA graphs before real traffic
 text = await engine.chat_text([{"role": "user", "content": "hi"}])
 await engine.load_lora_adapter("skills-v2", "/adapters/skills-v2")  # zero downtime
+await engine.rollback_lora()         # previous adapter stays loaded — instant revert
+
+from omniai.engine import EngineSupervisor
+supervisor = EngineSupervisor(engine)  # restart on crash, re-apply LoRA, warm up
+await supervisor.start()
 ```
 
 ### Build an agent graph
