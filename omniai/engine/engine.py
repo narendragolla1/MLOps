@@ -1,0 +1,140 @@
+"""ModelEngine: factory facade over the serving backends.
+
+The engine owns the backend subprocess lifecycle and exposes a single async
+OpenAI-compatible client interface (``chat``) plus dynamic LoRA hot-swapping,
+so the rest of the framework never touches backend-specific details.
+"""
+
+from __future__ import annotations
+
+from typing import Any, AsyncIterator
+
+import httpx
+
+from omniai.engine.backends import ADAPTERS, BackendAdapter
+from omniai.engine.config import EngineConfig
+from omniai.telemetry import traced_span
+
+
+class ModelEngine:
+    """Unified serving facade. Create via :meth:`ModelEngine.create`."""
+
+    def __init__(self, config: EngineConfig, adapter: BackendAdapter):
+        self.config = config
+        self.adapter = adapter
+        self.system_prompt: str | None = None
+        self.active_lora: str | None = None
+        self._client: httpx.AsyncClient | None = None
+
+    @classmethod
+    def create(cls, config: EngineConfig | dict[str, Any]) -> "ModelEngine":
+        """Factory: build the engine with the adapter for ``config.backend``."""
+        if isinstance(config, dict):
+            config = EngineConfig(**config)
+        adapter_cls = ADAPTERS.get(config.backend.value)
+        if adapter_cls is None:
+            raise ValueError(f"Unknown backend: {config.backend}")
+        return cls(config, adapter_cls(config))
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(base_url=self.config.base_url, timeout=120.0)
+        return self._client
+
+    async def start(self, wait: bool = True, timeout: float = 300.0) -> None:
+        """Launch the backend subprocess and optionally wait for readiness."""
+        self.adapter.start()
+        if wait:
+            ready = await self.adapter.wait_ready(timeout=timeout)
+            if not ready:
+                self.adapter.stop()
+                raise RuntimeError(
+                    f"{self.config.backend.value} server did not become ready "
+                    f"within {timeout}s"
+                )
+
+    async def stop(self) -> None:
+        self.adapter.stop()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    def set_system_prompt(self, prompt: str) -> None:
+        """Pre-cache a system prompt prepended to every conversation.
+
+        With SGLang this shared prefix is served from the RadixAttention
+        cache, so long skill prompts cost prefill only once.
+        """
+        self.system_prompt = prompt
+
+    def _build_messages(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        if self.system_prompt and (not messages or messages[0].get("role") != "system"):
+            return [{"role": "system", "content": self.system_prompt}, *messages]
+        return list(messages)
+
+    async def chat(
+        self,
+        messages: list[dict[str, str]],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """OpenAI-compatible chat completion against the live backend."""
+        payload: dict[str, Any] = {
+            "model": self.active_lora or self.config.model,
+            "messages": self._build_messages(messages),
+            **kwargs,
+        }
+        with traced_span(
+            "engine.chat", {"model": payload["model"], "backend": self.config.backend.value}
+        ) as span:
+            resp = await self.client.post("/v1/chat/completions", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            usage = data.get("usage") or {}
+            span.set_attributes(
+                {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                }
+            )
+            return data
+
+    async def chat_text(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        """Convenience wrapper returning just the first choice's content."""
+        data = await self.chat(messages, **kwargs)
+        return data["choices"][0]["message"]["content"]
+
+    async def stream_chat(
+        self, messages: list[dict[str, str]], **kwargs: Any
+    ) -> AsyncIterator[str]:
+        """Stream completion deltas as they arrive (SSE)."""
+        payload: dict[str, Any] = {
+            "model": self.active_lora or self.config.model,
+            "messages": self._build_messages(messages),
+            "stream": True,
+            **kwargs,
+        }
+        async with self.client.stream("POST", "/v1/chat/completions", json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                chunk = line.removeprefix("data:").strip()
+                if chunk == "[DONE]":
+                    break
+                import json
+
+                delta = json.loads(chunk)["choices"][0].get("delta", {})
+                if content := delta.get("content"):
+                    yield content
+
+    async def load_lora_adapter(self, name: str, path: str, activate: bool = True) -> bool:
+        """Hot-swap a LoRA adapter into the running server, zero downtime."""
+        endpoint = self.adapter.lora_load_endpoint()
+        payload = self.adapter.lora_load_payload(name, path)
+        with traced_span("engine.load_lora", {"adapter": name}):
+            resp = await self.client.post(endpoint, json=payload)
+            resp.raise_for_status()
+        if activate:
+            self.active_lora = name
+        return True
