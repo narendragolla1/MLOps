@@ -94,6 +94,37 @@ learner = ContinuousLearner(buffer, LoRATrainer(engine.config.model),
 buffer.on_threshold = learner.trigger   # train + eval + hot-swap at threshold
 ```
 
+## LangChain-style building blocks
+
+```python
+from omniai.models import OpenAIChatModel, AnthropicChatModel, EngineChatModel
+from omniai.prompts import ChatPromptTemplate, MessagesPlaceholder
+from omniai.graph import create_tool_agent, tool
+
+model = AnthropicChatModel("claude-sonnet-5", api_key=...)   # or OpenAI / self-hosted engine
+
+# Prompt templates with validated variables and history placeholders
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a {style} assistant."),
+    MessagesPlaceholder("history", optional=True),
+    ("user", "{question}"),
+])
+
+# Prebuilt tool-calling agent: model <-> tools loop until a final answer
+agent = create_tool_agent(model, [get_weather], max_steps=8)
+result = await agent.ainvoke({"messages": [OmniMessage(content="weather in Paris?")]})
+
+# Structured output: validated Pydantic objects, retry-on-parse-failure
+plan = await model.with_structured_output(TripPlan).invoke("Plan my afternoon")
+```
+
+- **`omniai.models`** — one `ChatModel` interface across providers: `OpenAIChatModel` (OpenAI + any OpenAI-compatible endpoint), `AnthropicChatModel` (Messages API with tool_use translation), `EngineChatModel` (self-hosted vLLM/SGLang engine, inheriting its breaker/retries/metrics). Native tool calling on all three.
+- **`omniai.prompts`** — `PromptTemplate` / `ChatPromptTemplate` / `MessagesPlaceholder` / few-shot examples.
+- **`omniai.graph.create_tool_agent`** — the agent executor loop with schema-validated tool execution; tool errors are fed back to the model instead of crashing the run.
+- **`with_structured_output(schema)`** — JSON-schema-guided output with validate-and-retry.
+
+See `examples/tool_agent.py` for a runnable end-to-end demo.
+
 ## Production deployment (Docker Compose)
 
 The `deploy/` directory ships a production stack: the **gateway** (this app, non-root image with healthchecks), **Postgres** (interaction log), and **vLLM** (GPU serving container, sharing an `adapters` volume with the gateway so LoRA hot-swaps work by path).
