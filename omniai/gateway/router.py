@@ -60,6 +60,7 @@ class GatewayRouter:
         observers: list[Observer] | None = None,
         app: FastAPI | None = None,
         settings: OmniSettings | None = None,
+        shutdown_hooks: list[Callable[[], Any]] | None = None,
     ):
         self.handler = handler
         self.interceptors = list(interceptors or [])
@@ -70,8 +71,35 @@ class GatewayRouter:
         self.ws = WebSocketAdapter()
         self.discord = DiscordAdapter()
         self._register_routes()
+        self._register_error_handlers()
+        for hook in shutdown_hooks or []:
+            self.app.add_event_handler("shutdown", hook)
         if settings is not None:
             self._apply_security(settings)
+
+    def _register_error_handlers(self) -> None:
+        """Problem-details JSON for failures; never leak stack traces."""
+        from fastapi import Request
+        from fastapi.responses import JSONResponse
+
+        from omniai.engine.resilience import EngineUnavailable
+
+        @self.app.exception_handler(EngineUnavailable)
+        async def engine_unavailable(request: Request, exc: EngineUnavailable) -> JSONResponse:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"type": "engine_unavailable", "detail": str(exc)}},
+                headers={"Retry-After": "5"},
+            )
+
+        @self.app.exception_handler(Exception)
+        async def unhandled(request: Request, exc: Exception) -> JSONResponse:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {"type": "internal_error", "detail": "internal server error"}
+                },
+            )
 
     def _apply_security(self, settings: OmniSettings) -> None:
         from starlette.middleware.cors import CORSMiddleware

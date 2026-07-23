@@ -26,6 +26,18 @@ class EngineConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
 
+    # Process ownership: managed=True spawns/supervises the server subprocess;
+    # managed=False attaches to an already-running server (e.g. the vLLM
+    # container in the compose stack) at external_base_url.
+    managed: bool = True
+    external_base_url: str | None = None
+
+    # Reliability knobs for the HTTP client around the backend.
+    request_timeout_s: float = 120.0
+    retries: int = 3
+    breaker_failure_threshold: int = 5
+    breaker_reset_s: float = 30.0
+
     # Hardware optimizations (mapped per-backend by the adapters).
     quantization: str | None = None  # e.g. "fp8", "awq", "gptq"
     kv_cache: str | None = None  # e.g. "paged_attention", "radix_attention"
@@ -46,4 +58,6 @@ class EngineConfig(BaseModel):
 
     @property
     def base_url(self) -> str:
+        if self.external_base_url:
+            return self.external_base_url.rstrip("/")
         return f"http://{self.host}:{self.port}"
