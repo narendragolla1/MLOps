@@ -14,8 +14,10 @@ installed; a custom ``train_fn`` can be injected for tests or bespoke loops.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Callable
 from concurrent.futures import Executor, ProcessPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -106,14 +108,18 @@ class LoRATrainer:
         self.train_fn = train_fn or _default_peft_train
         self.executor = executor
         self.hyperparams = hyperparams
-        self._version = 0
+
+    def _adapter_name(self) -> str:
+        # Timestamp + random suffix: unique across process restarts, unlike
+        # an in-memory version counter (which would collide after a restart).
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        return f"{Path(self.base_model).name}-lora-{stamp}-{uuid.uuid4().hex[:4]}"
 
     async def train(self, pairs: list[dict[str, str]]) -> tuple[str, str]:
         """Train an adapter; returns (adapter_name, adapter_path)."""
         if not pairs:
             raise ValueError("No training pairs; refusing to train an empty adapter")
-        self._version += 1
-        name = f"{Path(self.base_model).name}-lora-v{self._version}"
+        name = self._adapter_name()
         output_dir = str(self.output_root / name)
         loop = asyncio.get_running_loop()
         executor = self.executor
@@ -165,12 +171,20 @@ class ContinuousLearner:
         engine=None,
         evaluator: Callable[[str, str], Any] | None = None,
         min_pairs: int = 1,
+        since: datetime | None = None,
     ):
         self.buffer = buffer
         self.trainer = trainer
         self.engine = engine
         self.evaluator = evaluator
         self.min_pairs = min_pairs
+        # Incremental-training high-water mark: each cycle trains only on
+        # interactions logged after the previous trained cycle, instead of
+        # refetching and retraining on the whole table every time. Seed
+        # ``since`` to resume after a process restart. A user message whose
+        # assistant reply lands after a cycle boundary loses that one pair —
+        # an accepted trade-off for bounded cycle cost.
+        self.high_water: datetime | None = since
         self._lock = asyncio.Lock()
         self.history: list[dict[str, Any]] = []
         # Observability hook: called with each cycle's report dict.
@@ -182,11 +196,18 @@ class ContinuousLearner:
             self.on_report(report)
         return report
 
+    @staticmethod
+    def _max_created_at(logs: list[dict[str, Any]]) -> datetime | None:
+        stamps = [row["created_at"] for row in logs if row.get("created_at")]
+        if not stamps:
+            return None
+        return max(datetime.fromisoformat(stamp) for stamp in stamps)
+
     async def run_cycle(self) -> dict[str, Any]:
         """One full learning cycle; returns a status report."""
         async with self._lock:
             with traced_span("memory.learning_cycle") as span:
-                logs = await self.buffer.fetch()
+                logs = await self.buffer.fetch(since=self.high_water)
                 system_prompt = getattr(self.engine, "system_prompt", None)
                 pairs = format_training_pairs(logs, system_prompt=system_prompt)
                 if len(pairs) < self.min_pairs:
@@ -195,6 +216,9 @@ class ContinuousLearner:
                     )
 
                 name, path = await self.trainer.train(pairs)
+                # Data is consumed once trained, even if the gate rejects the
+                # adapter — retraining the same rows would fail the same way.
+                self.high_water = self._max_created_at(logs) or self.high_water
 
                 if self.evaluator is not None:
                     verdict = self.evaluator(name, path)

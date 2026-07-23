@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,10 @@ class InteractionBuffer:
         self._engine: AsyncEngine | None = None
         self._ready_lock = asyncio.Lock()
         self._threshold_fired_at: int | None = None
+        # Incrementally maintained so the threshold check never needs a
+        # COUNT(*) round-trip per logged message. Seeded from the DB once;
+        # slight drift on upserts is harmless for threshold purposes.
+        self._approx_count: int = 0
 
     async def _ensure_ready(self) -> AsyncEngine:
         if self._engine is None:
@@ -60,7 +64,8 @@ class InteractionBuffer:
                         await conn.run_sync(SQLModel.metadata.create_all)
                     self._engine = engine
         if self._threshold_fired_at is None:
-            self._threshold_fired_at = await self._count()
+            self._approx_count = await self._count()
+            self._threshold_fired_at = self._approx_count
         return self._engine
 
     async def _count(self) -> int:
@@ -94,11 +99,11 @@ class InteractionBuffer:
         async with AsyncSession(self._engine) as session:
             await session.merge(self._to_row(message))
             await session.commit()
+        self._approx_count += 1
         if self.threshold is None or self.on_threshold is None:
             return
-        count = await self._count()
-        if count - (self._threshold_fired_at or 0) >= self.threshold:
-            self._threshold_fired_at = count
+        if self._approx_count - (self._threshold_fired_at or 0) >= self.threshold:
+            self._threshold_fired_at = self._approx_count
             result = self.on_threshold()
             if asyncio.iscoroutine(result):
                 await result
@@ -108,13 +113,24 @@ class InteractionBuffer:
         return await self._count()
 
     async def fetch(
-        self, session_id: str | None = None, limit: int | None = None
+        self,
+        session_id: str | None = None,
+        limit: int | None = None,
+        since: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Rows as plain dicts, oldest first (keys match the legacy schema)."""
+        """Rows as plain dicts, oldest first (keys match the legacy schema).
+
+        ``since`` filters to rows created strictly after the given (naive
+        UTC) timestamp — the incremental-training high-water mark.
+        """
         await self._ensure_ready()
         query = select(Interaction)
         if session_id is not None:
             query = query.where(Interaction.session_id == session_id)
+        if since is not None:
+            if since.tzinfo is not None:
+                since = since.astimezone(UTC).replace(tzinfo=None)
+            query = query.where(Interaction.created_at > since)
         query = query.order_by(Interaction.created_at, Interaction.id)
         if limit is not None:
             query = query.limit(limit)

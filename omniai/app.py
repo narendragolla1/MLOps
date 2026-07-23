@@ -47,6 +47,7 @@ def create_app(settings: OmniSettings | None = None) -> FastAPI:
             "retries": settings.engine_retries,
             "breaker_failure_threshold": settings.breaker_failure_threshold,
             "breaker_reset_s": settings.breaker_reset_s,
+            "max_concurrent_requests": settings.engine_max_concurrency,
         }
     )
 

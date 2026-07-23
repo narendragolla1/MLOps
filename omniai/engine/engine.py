@@ -7,6 +7,7 @@ so the rest of the framework never touches backend-specific details.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -39,7 +40,16 @@ class ModelEngine:
         self.supervisor: EngineSupervisor | None = None
         # Observability hook: called with (prompt_tokens, completion_tokens).
         self.on_usage: Any = None
+        self.in_flight = 0
         self._client: httpx.AsyncClient | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        # Created lazily so the engine can be constructed outside a loop.
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+        return self._semaphore
 
     @classmethod
     def create(cls, config: EngineConfig | dict[str, Any]) -> ModelEngine:
@@ -108,7 +118,12 @@ class ModelEngine:
             return await with_retries(attempt, attempts=self.config.retries)
 
         try:
-            return await self.breaker.call(guarded)
+            async with self.semaphore:  # backpressure toward the backend
+                self.in_flight += 1
+                try:
+                    return await self.breaker.call(guarded)
+                finally:
+                    self.in_flight -= 1
         except EngineUnavailable:
             raise
         except (httpx.TransportError, httpx.HTTPStatusError) as exc:

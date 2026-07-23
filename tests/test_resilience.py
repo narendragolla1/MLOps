@@ -211,6 +211,67 @@ async def test_supervisor_restarts_and_reapplies_lora():
     assert ("skills-v3", "/adapters/skills-v3") in engine.lora_loads
 
 
+async def test_supervisor_failure_is_recorded_not_silent():
+    class DeadAdapter:
+        process = FakeProcess(alive=False)
+
+        def start(self):
+            raise RuntimeError("cannot spawn")
+
+    class FakeEngine:
+        adapter = DeadAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    supervisor = EngineSupervisor(
+        FakeEngine(), check_interval=0.01, max_restarts=0, restart_backoff_base=0.01
+    )
+    supervisor.start()
+    await asyncio.sleep(0.1)
+    assert supervisor.failed
+    assert "max_restarts" in (supervisor.failure_reason or "")
+    await supervisor.stop()
+
+
+async def test_semaphore_bounds_engine_concurrency():
+    active = {"now": 0, "max": 0}
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        active["now"] += 1
+        active["max"] = max(active["max"], active["now"])
+        await asyncio.sleep(0.02)
+        active["now"] -= 1
+        return httpx.Response(
+            200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+        )
+
+    engine = _engine_with_transport(slow_handler, max_concurrent_requests=1)
+    await asyncio.gather(*(engine.chat([{"role": "user", "content": "x"}]) for _ in range(3)))
+    assert active["max"] == 1  # requests serialized by the backpressure semaphore
+    assert engine.in_flight == 0
+
+
+async def test_half_open_allows_single_probe():
+    breaker = CircuitBreaker(failure_threshold=1, reset_timeout=0.01)
+    with pytest.raises(httpx.ConnectError):
+        await breaker.call(_failing)
+    await asyncio.sleep(0.02)  # breaker moves to half-open
+
+    started = asyncio.Event()
+
+    async def slow_probe():
+        started.set()
+        await asyncio.sleep(0.05)
+        return "up"
+
+    probe = asyncio.create_task(breaker.call(slow_probe))
+    await started.wait()
+    with pytest.raises(EngineUnavailable, match="probe in flight"):
+        await breaker.call(slow_probe)  # concurrent call fails fast
+    assert await probe == "up"
+    assert breaker.state is BreakerState.CLOSED
+
+
 async def test_supervisor_ignores_healthy_process():
     class FakeAdapter:
         def __init__(self):

@@ -92,6 +92,23 @@ def test_body_size_cap():
     assert resp.status_code == 413
 
 
+def test_body_size_cap_enforced_for_chunked_uploads():
+    """No Content-Length header (chunked transfer) must not bypass the cap."""
+    router = make_router(max_body_bytes=100)
+    client = TestClient(router.app, raise_server_exceptions=False)
+
+    def chunks():
+        yield b'{"content": "' + b"y" * 500 + b'"}'
+
+    resp = client.post(
+        "/v1/messages",
+        content=chunks(),
+        headers={"X-API-Key": "good-key", "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 413
+    assert resp.json()["error"]["type"] == "payload_too_large"
+
+
 def test_token_bucket_refills():
     limiter = TokenBucketRateLimiter(rate=1000.0, burst=1)
     assert limiter.allow("k") is None

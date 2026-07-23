@@ -44,6 +44,17 @@ def test_metrics_expose_request_counts_and_latency():
     assert "omniai_request_latency_seconds_bucket" in body
 
 
+def test_metrics_labels_bounded_for_unmatched_paths():
+    """Scanner 404s must not create one Prometheus series per random URL."""
+    router = make_router()
+    client = TestClient(router.app)
+    for i in range(3):
+        client.get(f"/wp-admin/exploit-{i}", headers=AUTH)
+    body = client.get("/metrics").text
+    assert "exploit-0" not in body
+    assert 'path="unmatched"' in body
+
+
 def test_engine_token_usage_feeds_metrics():
     engine = ModelEngine.create({"model": "m"})
 

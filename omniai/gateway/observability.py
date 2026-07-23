@@ -119,7 +119,11 @@ def metrics_middleware(metrics: Metrics) -> Callable[[Request, Callable], Awaita
         start = time.perf_counter()
         response: Response = await call_next(request)
         elapsed = time.perf_counter() - start
-        path = request.url.path
+        # Label with the matched route template, never the raw URL: raw
+        # paths (e.g. scanner 404s) would grow Prometheus series without
+        # bound. Unrouted requests share one "unmatched" label.
+        route = request.scope.get("route")
+        path = getattr(route, "path", "unmatched")
         metrics.requests.labels(request.method, path, str(response.status_code)).inc()
         metrics.latency.labels(request.method, path).observe(elapsed)
         return response

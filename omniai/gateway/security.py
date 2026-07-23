@@ -11,6 +11,7 @@ from __future__ import annotations
 import secrets
 import time
 
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -21,6 +22,19 @@ from omniai.settings import OmniSettings
 WS_POLICY_VIOLATION = 4401  # app-level close code for failed WS auth
 
 EXEMPT_PATHS = {"/health", "/health/live", "/health/ready", "/metrics"}
+
+
+class BodyLimitExceeded(HTTPException):
+    """Request body exceeded the configured size cap while being read.
+
+    Raised from the wrapped ``receive`` so chunked uploads (which carry no
+    Content-Length header) are still capped. Subclasses HTTPException so
+    FastAPI's body-parsing error handling re-raises it instead of masking
+    it as a generic 400; the GatewayRouter renders it as a 413.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(status_code=413, detail=detail)
 
 
 def _key_valid(candidate: str | None, keys: list[str]) -> bool:
@@ -52,6 +66,37 @@ class TokenBucketRateLimiter:
             return None
         self._buckets[key] = (tokens, now)
         return (1.0 - tokens) / self.rate
+
+
+class BodyLimitMiddleware:
+    """Innermost middleware capping the request body while it is read.
+
+    Catches chunked uploads that carry no Content-Length. Must be added
+    *before* any BaseHTTPMiddleware (so it sits innermost): those bridge the
+    body through their own stream, and the limit error must surface inside
+    the routing layer's exception handling to become a clean 413.
+    """
+
+    def __init__(self, app: ASGIApp, settings: OmniSettings):
+        self.app = app
+        self.limit = settings.max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive() -> dict:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.limit:
+                    raise BodyLimitExceeded(f"request body exceeded {self.limit} bytes")
+            return message
+
+        await self.app(scope, limited_receive, send)
 
 
 class SecurityMiddleware:
@@ -97,7 +142,6 @@ class SecurityMiddleware:
                 )
                 await response(scope, receive, send)
                 return
-
         await self.app(scope, receive, send)
 
     @staticmethod

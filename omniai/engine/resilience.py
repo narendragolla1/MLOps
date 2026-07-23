@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,8 @@ from enum import StrEnum
 from typing import Any, TypeVar
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -79,6 +82,7 @@ class CircuitBreaker:
         self.state = BreakerState.CLOSED
         self.failures = 0
         self.opened_at = 0.0
+        self._probing = False  # only one half-open probe may be in flight
 
     def _maybe_half_open(self) -> None:
         if (
@@ -91,6 +95,12 @@ class CircuitBreaker:
         self._maybe_half_open()
         if self.state is BreakerState.OPEN:
             raise EngineUnavailable(f"circuit breaker open (retry in <= {self.reset_timeout}s)")
+        if self.state is BreakerState.HALF_OPEN:
+            # Let a single request probe the backend; the rest fail fast
+            # instead of stampeding a server that may still be recovering.
+            if self._probing:
+                raise EngineUnavailable("circuit breaker half-open, probe in flight")
+            self._probing = True
         try:
             result = await fn()
         except Exception:
@@ -100,12 +110,14 @@ class CircuitBreaker:
         return result
 
     def _record_failure(self) -> None:
+        self._probing = False
         self.failures += 1
         if self.state is BreakerState.HALF_OPEN or self.failures >= self.failure_threshold:
             self.state = BreakerState.OPEN
             self.opened_at = time.monotonic()
 
     def _record_success(self) -> None:
+        self._probing = False
         self.failures = 0
         self.state = BreakerState.CLOSED
 
@@ -127,6 +139,10 @@ class EngineSupervisor:
         self.ready_timeout = ready_timeout
         self.restart_backoff_base = restart_backoff_base
         self.restarts = 0
+        # Terminal-failure signal: readiness probes report this so a dead
+        # backend flips the pod unready instead of failing silently.
+        self.failed = False
+        self.failure_reason: str | None = None
         self._task: asyncio.Task | None = None
         self._stopped = asyncio.Event()
 
@@ -148,15 +164,29 @@ class EngineSupervisor:
         return process is not None and process.poll() is None
 
     async def _watch(self) -> None:
-        while not self._stopped.is_set():
-            await asyncio.sleep(self.check_interval)
-            if self._stopped.is_set() or self._process_alive():
-                continue
-            if self.restarts >= self.max_restarts:
-                raise EngineUnavailable(
-                    f"backend crashed and exceeded max_restarts={self.max_restarts}"
+        try:
+            while not self._stopped.is_set():
+                await asyncio.sleep(self.check_interval)
+                if self._stopped.is_set() or self._process_alive():
+                    continue
+                if self.restarts >= self.max_restarts:
+                    raise EngineUnavailable(
+                        f"backend crashed and exceeded max_restarts={self.max_restarts}"
+                    )
+                logger.warning(
+                    "engine backend process died; restart %d/%d",
+                    self.restarts + 1,
+                    self.max_restarts,
                 )
-            await self._restart()
+                await self._restart()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Never die silently: record the failure so /health/ready and
+            # operators can see it, then stop watching.
+            self.failed = True
+            self.failure_reason = f"{type(exc).__name__}: {exc}"
+            logger.exception("engine supervisor giving up: %s", exc)
 
     async def _restart(self) -> None:
         self.restarts += 1

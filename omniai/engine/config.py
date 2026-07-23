@@ -37,6 +37,9 @@ class EngineConfig(BaseModel):
     retries: int = 3
     breaker_failure_threshold: int = 5
     breaker_reset_s: float = 30.0
+    # Backpressure: bound on concurrent in-flight requests to the backend so
+    # a burst that passes the rate limiter cannot pile onto the server.
+    max_concurrent_requests: int = 32
 
     # Hardware optimizations (mapped per-backend by the adapters).
     quantization: str | None = None  # e.g. "fp8", "awq", "gptq"

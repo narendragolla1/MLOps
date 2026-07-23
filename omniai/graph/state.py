@@ -26,17 +26,23 @@ class State(BaseModel):
     messages: list[OmniMessage] = Field(default_factory=list)
 
     def merge(self, update: State | dict[str, Any] | None) -> Self:
-        """Return a new state with ``update`` applied on top of this one."""
+        """Return a new state with ``update`` applied on top of this one.
+
+        Avoids re-serializing the whole state per node (which made long
+        message histories O(n²) over a run): existing messages are carried
+        by reference and only the appended ones are validated. Non-message
+        fields are applied via ``model_copy`` — node updates are trusted to
+        match the declared field types.
+        """
         if update is None:
             return self
         if isinstance(update, State):
             update = update.model_dump(exclude_unset=True)
-        data = self.model_dump()
-        for key, value in update.items():
-            if key == "messages" and isinstance(value, list):
-                data["messages"] = data["messages"] + [
-                    m.model_dump() if isinstance(m, OmniMessage) else m for m in value
-                ]
-            else:
-                data[key] = value
-        return type(self).model_validate(data)
+        updates = dict(update)
+        appended = updates.pop("messages", None)
+        if appended:
+            normalized = [
+                m if isinstance(m, OmniMessage) else OmniMessage.model_validate(m) for m in appended
+            ]
+            updates["messages"] = [*self.messages, *normalized]
+        return self.model_copy(update=updates)

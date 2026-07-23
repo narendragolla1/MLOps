@@ -81,6 +81,12 @@ class GatewayRouter:
         for hook in shutdown_hooks or []:
             self.app.router.add_event_handler("shutdown", hook)
         if settings is not None:
+            # First added = innermost: the body limit must sit inside the
+            # observability BaseHTTPMiddlewares so its 413 surfaces through
+            # FastAPI's exception handling (see BodyLimitMiddleware).
+            from omniai.gateway.security import BodyLimitMiddleware
+
+            self.app.add_middleware(BodyLimitMiddleware, settings=settings)
             self._apply_observability(settings)
             self._apply_security(settings)
 
@@ -132,8 +138,12 @@ class GatewayRouter:
                     await self.buffer.count()
                 except Exception as exc:
                     problems.append(f"database: {type(exc).__name__}")
-            if self.engine is not None and self.engine.breaker.state is BreakerState.OPEN:
-                problems.append("engine: circuit breaker open")
+            if self.engine is not None:
+                if self.engine.breaker.state is BreakerState.OPEN:
+                    problems.append("engine: circuit breaker open")
+                supervisor = self.engine.supervisor
+                if supervisor is not None and supervisor.failed:
+                    problems.append(f"engine: supervisor failed ({supervisor.failure_reason})")
             if problems:
                 return JSONResponse(
                     status_code=503, content={"status": "unready", "problems": problems}
@@ -146,6 +156,7 @@ class GatewayRouter:
         from fastapi.responses import JSONResponse
 
         from omniai.engine.resilience import EngineUnavailable
+        from omniai.gateway.security import BodyLimitExceeded
 
         @self.app.exception_handler(EngineUnavailable)
         async def engine_unavailable(request: Request, exc: EngineUnavailable) -> JSONResponse:
@@ -153,6 +164,13 @@ class GatewayRouter:
                 status_code=503,
                 content={"error": {"type": "engine_unavailable", "detail": str(exc)}},
                 headers={"Retry-After": "5"},
+            )
+
+        @self.app.exception_handler(BodyLimitExceeded)
+        async def body_too_large(request: Request, exc: BodyLimitExceeded) -> JSONResponse:
+            return JSONResponse(
+                status_code=413,
+                content={"error": {"type": "payload_too_large", "detail": str(exc)}},
             )
 
         @self.app.exception_handler(Exception)

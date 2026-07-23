@@ -126,7 +126,47 @@ async def test_full_cycle_trains_and_hot_swaps(tmp_path):
     assert report["status"] == "deployed"
     assert report["pairs"] == 1
     assert engine.swaps == [(report["adapter"], report["path"])]
-    assert "lora-v1" in report["adapter"]
+    assert "-lora-" in report["adapter"]
+    buffer.close()
+
+
+async def test_adapter_names_unique_across_trainer_instances(tmp_path):
+    pairs = [{"prompt": "p", "completion": "c"}]
+    names = set()
+    for _ in range(2):  # fresh trainer each time simulates a process restart
+        trainer = LoRATrainer("base/model", tmp_path / "adapters", train_fn=fake_train)
+        name, _ = await trainer.train(pairs)
+        names.add(name)
+    assert len(names) == 2
+
+
+async def test_incremental_training_uses_high_water_mark(tmp_path):
+    trained_batches = []
+
+    def spy_train(base_model, pairs, output_dir, **hp):
+        trained_batches.append(len(pairs))
+        return output_dir
+
+    buffer = InteractionBuffer(tmp_path / "log.db")
+    await _seed(buffer)
+    engine = SwapRecordingEngine()
+    trainer = LoRATrainer("base/model", tmp_path / "adapters", executor=None, train_fn=spy_train)
+    # thread-friendly: spy closure can't cross a process boundary
+    from concurrent.futures import ThreadPoolExecutor
+
+    trainer.executor = ThreadPoolExecutor(max_workers=1)
+    learner = ContinuousLearner(buffer, trainer, engine=engine)
+
+    assert (await learner.run_cycle())["status"] == "deployed"
+    # No new data: second cycle must skip instead of retraining everything.
+    assert (await learner.run_cycle())["status"] == "skipped"
+
+    await buffer.log(OmniMessage(content="q2", role=Role.USER, session_id="s2"))
+    await buffer.log(OmniMessage(content="a2", role=Role.ASSISTANT, session_id="s2"))
+    report = await learner.run_cycle()
+    assert report["status"] == "deployed"
+    assert report["pairs"] == 1  # only the new pair, not the full history
+    assert trained_batches == [1, 1]
     buffer.close()
 
 

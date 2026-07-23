@@ -50,6 +50,7 @@ class OmniSettings(BaseSettings):
     breaker_failure_threshold: int = 5
     breaker_reset_s: float = 30.0
     supervisor_max_restarts: int = 5
+    engine_max_concurrency: int = 32
 
     # --- observability -----------------------------------------------------
     log_level: str = "INFO"
