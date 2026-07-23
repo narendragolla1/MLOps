@@ -14,9 +14,10 @@ installed; a custom ``train_fn`` can be injected for tests or bespoke loops.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from concurrent.futures import Executor, ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from omniai.telemetry import traced_span
 
@@ -216,6 +217,6 @@ class ContinuousLearner:
                     {"status": "deployed", "adapter": name, "path": path, "pairs": len(pairs)}
                 )
 
-    def trigger(self) -> "asyncio.Task[dict[str, Any]]":
+    def trigger(self) -> asyncio.Task[dict[str, Any]]:
         """Fire-and-forget cycle; suitable as an on_threshold callback."""
         return asyncio.get_running_loop().create_task(self.run_cycle())

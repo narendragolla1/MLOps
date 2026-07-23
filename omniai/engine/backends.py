@@ -87,9 +87,13 @@ class VLLMAdapter(BackendAdapter):
     def build_command(self) -> list[str]:
         cfg = self.config
         cmd = [
-            "vllm", "serve", cfg.model,
-            "--host", cfg.host,
-            "--port", str(cfg.port),
+            "vllm",
+            "serve",
+            cfg.model,
+            "--host",
+            cfg.host,
+            "--port",
+            str(cfg.port),
         ]
         if cfg.quantization:
             cmd.extend(["--quantization", cfg.quantization])
@@ -123,10 +127,15 @@ class SGLangAdapter(BackendAdapter):
     def build_command(self) -> list[str]:
         cfg = self.config
         cmd = [
-            sys.executable, "-m", "sglang.launch_server",
-            "--model-path", cfg.model,
-            "--host", cfg.host,
-            "--port", str(cfg.port),
+            sys.executable,
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            cfg.model,
+            "--host",
+            cfg.host,
+            "--port",
+            str(cfg.port),
         ]
         if cfg.quantization:
             cmd.extend(["--quantization", cfg.quantization])

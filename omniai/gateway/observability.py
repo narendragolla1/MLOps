@@ -15,7 +15,8 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -95,9 +96,7 @@ def configure_logging(settings: OmniSettings) -> None:
     if settings.log_json:
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
     root.handlers = [handler]
 
 
@@ -144,9 +143,7 @@ def setup_tracing(settings: OmniSettings) -> bool:
             "install omniai[telemetry]"
         )
         return False
-    provider = TracerProvider(
-        resource=Resource.create({"service.name": settings.service_name})
-    )
+    provider = TracerProvider(resource=Resource.create({"service.name": settings.service_name}))
     provider.add_span_processor(
         BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.otlp_endpoint))
     )

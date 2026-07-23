@@ -79,10 +79,9 @@ class SecurityMiddleware:
             return
 
         api_key = self._extract_key(scope)
-        if self.settings.auth_enabled:
-            if not _key_valid(api_key, self.settings.api_keys):
-                await self._reject_auth(scope, receive, send)
-                return
+        if self.settings.auth_enabled and not _key_valid(api_key, self.settings.api_keys):
+            await self._reject_auth(scope, receive, send)
+            return
 
         retry_after = self.rate_limiter.allow(api_key or "anonymous")
         if retry_after is not None:

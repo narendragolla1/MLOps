@@ -43,7 +43,7 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
     meta: dict[str, str] = {}
     for idx, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
-            return meta, "\n".join(lines[idx + 1:])
+            return meta, "\n".join(lines[idx + 1 :])
         if ":" in line:
             key, _, value = line.partition(":")
             meta[key.strip()] = value.strip()

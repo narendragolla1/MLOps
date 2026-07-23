@@ -7,13 +7,13 @@ adapter maps those settings to its own CLI flags.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
 
-class Backend(str, Enum):
+class Backend(StrEnum):
     VLLM = "vllm"
     SGLANG = "sglang"
 

@@ -9,8 +9,8 @@ can exercise the policy without a Docker daemon.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 LANGUAGE_COMMANDS: dict[str, list[str]] = {
     "python": ["python3", "-c"],
@@ -40,7 +40,7 @@ class SandboxExecution:
         memory_limit: str = "256m",
         cpu_limit: float = 1.0,
         network: bool = False,
-        runner: Callable[..., "asyncio.Future"] | None = None,
+        runner: Callable[..., asyncio.Future] | None = None,
     ):
         self.image = image
         self.timeout = timeout
@@ -53,14 +53,20 @@ class SandboxExecution:
         if language not in LANGUAGE_COMMANDS:
             raise ValueError(f"Unsupported language: {language!r}")
         cmd = [
-            "docker", "run",
+            "docker",
+            "run",
             "--rm",
-            "--memory", self.memory_limit,
-            "--cpus", str(self.cpu_limit),
+            "--memory",
+            self.memory_limit,
+            "--cpus",
+            str(self.cpu_limit),
             "--read-only",
-            "--tmpfs", "/tmp:size=64m",
-            "--security-opt", "no-new-privileges",
-            "--user", "nobody",
+            "--tmpfs",
+            "/tmp:size=64m",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "nobody",
         ]
         if not self.network:
             cmd.extend(["--network", "none"])
@@ -77,10 +83,12 @@ class SandboxExecution:
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.wait()
-            return SandboxResult(exit_code=-1, stdout="", stderr="execution timed out", timed_out=True)
+            return SandboxResult(
+                exit_code=-1, stdout="", stderr="execution timed out", timed_out=True
+            )
         return SandboxResult(
             exit_code=proc.returncode or 0,
             stdout=stdout.decode(errors="replace"),

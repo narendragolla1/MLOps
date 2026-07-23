@@ -7,7 +7,8 @@ so the rest of the framework never touches backend-specific details.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
@@ -41,7 +42,7 @@ class ModelEngine:
         self._client: httpx.AsyncClient | None = None
 
     @classmethod
-    def create(cls, config: EngineConfig | dict[str, Any]) -> "ModelEngine":
+    def create(cls, config: EngineConfig | dict[str, Any]) -> ModelEngine:
         """Factory: build the engine with the adapter for ``config.backend``."""
         if isinstance(config, dict):
             config = EngineConfig(**config)
@@ -79,8 +80,7 @@ class ModelEngine:
             if not ready:
                 self.adapter.stop()
                 raise EngineUnavailable(
-                    f"{self.config.backend.value} server did not become ready "
-                    f"within {timeout}s"
+                    f"{self.config.backend.value} server did not become ready within {timeout}s"
                 )
         if supervise:
             self.supervisor = EngineSupervisor(self)

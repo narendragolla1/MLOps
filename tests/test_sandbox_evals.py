@@ -7,16 +7,16 @@ from omniai.memory import ContinuousLearner, InteractionBuffer, LoRATrainer
 from omniai.protocol import OmniMessage, Role
 from omniai.sandbox import SandboxExecution, SandboxResult
 
-
 # -- sandbox ---------------------------------------------------------------
+
 
 def test_docker_command_is_locked_down():
     sandbox = SandboxExecution(image="python:3.11-slim", memory_limit="128m")
     cmd = sandbox.build_command("print(1)", "python")
     assert cmd[:2] == ["docker", "run"]
     assert "--rm" in cmd
-    assert ("--network", "none") == tuple(cmd[cmd.index("--network"):][:2])
-    assert ("--memory", "128m") == tuple(cmd[cmd.index("--memory"):][:2])
+    assert tuple(cmd[cmd.index("--network") :][:2]) == ("--network", "none")
+    assert tuple(cmd[cmd.index("--memory") :][:2]) == ("--memory", "128m")
     assert "--read-only" in cmd
     assert cmd[-3:] == ["python3", "-c", "print(1)"]
 
@@ -47,6 +47,7 @@ async def test_timeout_flagged_not_ok():
 
 
 # -- evals -----------------------------------------------------------------
+
 
 def _engine_with_responses(responses: dict[str, str]) -> ModelEngine:
     """Engine whose mock backend answers per (model, prompt)."""

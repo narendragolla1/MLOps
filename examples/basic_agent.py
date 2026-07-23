@@ -2,7 +2,9 @@
 
 Run:  python examples/basic_agent.py   then POST to http://localhost:8080/v1/messages
 """
-import json, pathlib, uvicorn
+import json
+import pathlib
+import uvicorn
 from omniai.engine import ModelEngine
 from omniai.gateway import GatewayRouter
 from omniai.graph import END, START, Graph, State, tool

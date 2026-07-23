@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlmodel import SQLModel, select
@@ -75,7 +76,7 @@ class InteractionBuffer:
         # tz-aware values for TIMESTAMP WITHOUT TIME ZONE).
         created = message.created_at
         if created.tzinfo is not None:
-            created = created.astimezone(timezone.utc).replace(tzinfo=None)
+            created = created.astimezone(UTC).replace(tzinfo=None)
         return Interaction(
             id=message.id,
             session_id=message.session_id,

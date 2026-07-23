@@ -10,7 +10,8 @@ follows the same pipeline:
 from __future__ import annotations
 
 import inspect
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
@@ -71,7 +72,7 @@ class GatewayRouter:
         self.settings = settings
         self.engine = engine
         self.buffer = buffer
-        self.metrics = None
+        self.metrics: Any = None
         self.rest = RestAdapter()
         self.ws = WebSocketAdapter()
         self.discord = DiscordAdapter()
@@ -158,9 +159,7 @@ class GatewayRouter:
         async def unhandled(request: Request, exc: Exception) -> JSONResponse:
             return JSONResponse(
                 status_code=500,
-                content={
-                    "error": {"type": "internal_error", "detail": "internal server error"}
-                },
+                content={"error": {"type": "internal_error", "detail": "internal server error"}},
             )
 
     def _apply_security(self, settings: OmniSettings) -> None:

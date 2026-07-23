@@ -4,7 +4,6 @@ from starlette.websockets import WebSocketDisconnect
 
 from omniai.gateway import GatewayRouter
 from omniai.gateway.security import WS_POLICY_VIOLATION, TokenBucketRateLimiter
-from omniai.protocol import OmniMessage
 from omniai.settings import OmniSettings
 
 
@@ -24,8 +23,7 @@ def test_missing_key_rejected():
 def test_wrong_key_rejected_valid_key_accepted():
     client = TestClient(make_router().app)
     assert (
-        client.post("/v1/messages", json={"content": "x"}, headers={"X-API-Key": "bad"})
-        .status_code
+        client.post("/v1/messages", json={"content": "x"}, headers={"X-API-Key": "bad"}).status_code
         == 401
     )
     resp = client.post("/v1/messages", json={"content": "x"}, headers={"X-API-Key": "good-key"})
@@ -59,9 +57,7 @@ def test_websocket_query_param_fallback():
 
 def test_fail_closed_without_keys():
     with pytest.raises(RuntimeError, match="OMNIAI_API_KEYS"):
-        GatewayRouter(
-            handler=lambda m: m.reply("ok"), settings=OmniSettings(_env_file=None)
-        )
+        GatewayRouter(handler=lambda m: m.reply("ok"), settings=OmniSettings(_env_file=None))
 
 
 def test_explicit_opt_out_runs_open():

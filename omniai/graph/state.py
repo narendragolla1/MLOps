@@ -25,7 +25,7 @@ class State(BaseModel):
 
     messages: list[OmniMessage] = Field(default_factory=list)
 
-    def merge(self, update: "State | dict[str, Any] | None") -> Self:
+    def merge(self, update: State | dict[str, Any] | None) -> Self:
         """Return a new state with ``update`` applied on top of this one."""
         if update is None:
             return self

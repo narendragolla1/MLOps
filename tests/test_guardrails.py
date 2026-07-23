@@ -74,6 +74,7 @@ def test_policy_is_extensible():
 
 # -- telemetry -------------------------------------------------------------
 
+
 def test_traced_span_records_latency_and_attributes():
     recorder.clear()
     with traced_span("unit.test", {"a": 1}) as span:

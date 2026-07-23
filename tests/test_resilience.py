@@ -15,8 +15,8 @@ from omniai.engine.resilience import (
 from omniai.gateway import GatewayRouter
 from omniai.protocol import OmniMessage
 
-
 # -- retries ---------------------------------------------------------------
+
 
 async def test_retries_transient_then_succeeds():
     calls = {"n": 0}
@@ -56,6 +56,7 @@ async def test_exhausted_retries_raise_last_error():
 
 # -- circuit breaker -------------------------------------------------------
 
+
 async def _failing():
     raise httpx.ConnectError("down")
 
@@ -89,6 +90,7 @@ async def test_half_open_failure_reopens():
 
 
 # -- engine integration ----------------------------------------------------
+
 
 def _engine_with_transport(handler, **config):
     engine = ModelEngine.create({"model": "m", "backend": "vllm", **config})
@@ -165,6 +167,7 @@ async def test_unhandled_errors_return_problem_json_without_trace():
 
 
 # -- supervision -----------------------------------------------------------
+
 
 class FakeProcess:
     def __init__(self, alive=True):

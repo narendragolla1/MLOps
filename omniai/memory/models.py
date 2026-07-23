@@ -13,7 +13,7 @@ from datetime import datetime
 from sqlmodel import Field, SQLModel
 
 
-class Interaction(SQLModel, table=True):
+class Interaction(SQLModel, table=True):  # type: ignore[call-arg]
     __tablename__ = "interactions"
 
     id: str = Field(primary_key=True)

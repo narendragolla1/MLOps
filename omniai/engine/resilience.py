@@ -10,10 +10,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import random
 import time
-from enum import Enum
-from typing import Any, Awaitable, Callable, TypeVar
+from collections.abc import Awaitable, Callable
+from enum import StrEnum
+from typing import Any, TypeVar
 
 import httpx
 
@@ -25,8 +27,16 @@ class EngineUnavailable(Exception):
 
 
 def _is_transient(exc: Exception) -> bool:
-    if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout,
-                        httpx.RemoteProtocolError, httpx.PoolTimeout)):
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ReadTimeout,
+            httpx.ConnectTimeout,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ),
+    ):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
@@ -50,10 +60,11 @@ async def with_retries(
             last_exc = exc
             delay = min(max_delay, base_delay * (2**attempt)) * random.random()
             await asyncio.sleep(delay)
-    raise last_exc  # pragma: no cover - loop always returns or raises
+    assert last_exc is not None  # pragma: no cover - loop always returns or raises
+    raise last_exc  # pragma: no cover
 
 
-class BreakerState(str, Enum):
+class BreakerState(StrEnum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
@@ -79,9 +90,7 @@ class CircuitBreaker:
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
         self._maybe_half_open()
         if self.state is BreakerState.OPEN:
-            raise EngineUnavailable(
-                f"circuit breaker open (retry in <= {self.reset_timeout}s)"
-            )
+            raise EngineUnavailable(f"circuit breaker open (retry in <= {self.reset_timeout}s)")
         try:
             result = await fn()
         except Exception:
@@ -130,10 +139,8 @@ class EngineSupervisor:
         self._stopped.set()
         if self._task is not None:
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self._task
-            except asyncio.CancelledError:
-                pass
             self._task = None
 
     def _process_alive(self) -> bool:

@@ -6,8 +6,6 @@ service container via OMNIAI_TEST_DATABASE_URL.
 
 import os
 
-import pytest
-
 from omniai.memory import InteractionBuffer
 from omniai.protocol import OmniMessage, Role
 
