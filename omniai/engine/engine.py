@@ -239,6 +239,10 @@ class ModelEngine:
             self.lora.activate(name)
         return True
 
+    def activate_lora(self, name: str) -> None:
+        """Make an already-loaded adapter the one served by default."""
+        self.lora.activate(name)
+
     async def unload_lora_adapter(self, name: str) -> bool:
         """Remove an adapter from the server and the registry."""
         with traced_span("engine.unload_lora", {"adapter": name}):

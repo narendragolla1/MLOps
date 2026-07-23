@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS interactions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_interactions_session ON interactions (session_id, created_at);
+CREATE TABLE IF NOT EXISTS training_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -76,12 +80,20 @@ class InteractionBuffer:
             )
             self._conn.commit()
 
-    def _fetch_sync(self, session_id: str | None, limit: int | None) -> list[dict[str, Any]]:
+    def _fetch_sync(
+        self, session_id: str | None, limit: int | None, since: str | None
+    ) -> list[dict[str, Any]]:
         query = "SELECT * FROM interactions"
+        clauses: list[str] = []
         params: list[Any] = []
         if session_id is not None:
-            query += " WHERE session_id = ?"
+            clauses.append("session_id = ?")
             params.append(session_id)
+        if since is not None:
+            clauses.append("created_at > ?")
+            params.append(since)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY created_at ASC"
         if limit is not None:
             query += " LIMIT ?"
@@ -90,6 +102,22 @@ class InteractionBuffer:
             self._conn.row_factory = sqlite3.Row
             rows = self._conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
+
+    def _get_state_sync(self, key: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM training_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def _set_state_sync(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO training_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
 
     # -- async API ----------------------------------------------------------
 
@@ -109,9 +137,24 @@ class InteractionBuffer:
         return await asyncio.to_thread(self._count_sync)
 
     async def fetch(
-        self, session_id: str | None = None, limit: int | None = None
+        self,
+        session_id: str | None = None,
+        limit: int | None = None,
+        since: str | None = None,
     ) -> list[dict[str, Any]]:
-        return await asyncio.to_thread(self._fetch_sync, session_id, limit)
+        """Fetch interactions, optionally only those after ``since`` (an
+        ISO timestamp — pass the training watermark to get only new data)."""
+        return await asyncio.to_thread(self._fetch_sync, session_id, limit, since)
+
+    async def get_watermark(self) -> str | None:
+        """Timestamp of the last interaction consumed by a successful
+        training cycle; None before the first cycle."""
+        return await asyncio.to_thread(self._get_state_sync, "watermark")
+
+    async def set_watermark(self, timestamp: str) -> None:
+        """Advance the watermark; persisted in the same database so restarts
+        never re-train on already-consumed data."""
+        await asyncio.to_thread(self._set_state_sync, "watermark", timestamp)
 
     def close(self) -> None:
         with self._lock:

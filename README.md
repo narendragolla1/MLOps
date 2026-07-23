@@ -37,7 +37,9 @@ python examples/basic_agent.py    # full pipeline in < 50 lines
 | `omniai.engine` | `ModelEngine` factory over vLLM/SGLang subprocesses; maps `quantization="fp8"`, `tensor_parallel_size=2`, `devices=[0,1]`, etc. to backend CLI flags and env; OpenAI-compatible async client with retry policy + bulkhead admission; LoRA lifecycle (load/unload/rollback) via a persistent `LoRARegistry`; `EngineSupervisor` watchdog with crash-loop backoff; pluggable backends via `register_backend` — see [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) |
 | `omniai.graph` | LangGraph-style builder: Pydantic `State`, sync/async nodes, lambda conditional edges, bounded cycles, `@tool` decorator generating JSON Schema from type hints |
 | `omniai.gateway` | `GatewayRouter` (FastAPI) with REST, WebSocket, and Discord adapters; interceptor + observer pipeline |
-| `omniai.memory` | `skill.md` ingestion into a pre-cached system prompt (RadixAttention-friendly), async SQLite `InteractionBuffer`, background `LoRATrainer` + `ContinuousLearner` cycle |
+| `omniai.rag` | Factual knowledge layer: `VectorStore` contract with dependency-free `InMemoryVectorStore`/`HashEmbedder`, PDF-style chunked ingestion, grounding `Retriever` — facts are retrieved, never trained into weights |
+| `omniai.tenancy` | Multi-tenant agents on one base model: `AgentProfile` (LoRA = behavior, retriever = facts), `AgentRegistry`, `TenantHandler` routing each request to its agent's LoRA — see [docs/COMPOUND_AI.md](docs/COMPOUND_AI.md) |
+| `omniai.memory` | `skill.md` ingestion into a pre-cached system prompt (RadixAttention-friendly), async SQLite `InteractionBuffer` with a persisted training watermark, `InteractionJudge` LLM-as-a-judge curation, `RehearsalBuffer` golden-data mixing, background `LoRATrainer` + `ContinuousLearner` cycle with a shadow gate |
 | `omniai.guardrails` | `PromptGuard` interceptor: prompt-injection blocking, PII redaction |
 | `omniai.telemetry` | OpenTelemetry spans (token counts, latency) with a no-dependency fallback recorder |
 | `omniai.sandbox` | `SandboxExecution`: LLM-generated Python/Bash in a locked-down, ephemeral Docker container |

@@ -103,10 +103,21 @@ class SwapRecordingEngine:
 
     def __init__(self):
         self.swaps = []
+        self.unloads = []
+        self.activated = []
 
     async def load_lora_adapter(self, name, path, activate=True):
         self.swaps.append((name, path))
+        if activate:
+            self.activated.append(name)
         return True
+
+    async def unload_lora_adapter(self, name):
+        self.unloads.append(name)
+        return True
+
+    def activate_lora(self, name):
+        self.activated.append(name)
 
 
 async def _seed(buffer):
@@ -148,7 +159,10 @@ async def test_eval_gate_rejects_bad_adapter(tmp_path):
     )
     report = await learner.run_cycle()
     assert report["status"] == "rejected"
-    assert engine.swaps == []
+    # Shadow gate: loaded invisibly for scoring, never activated, then purged.
+    assert engine.swaps == [(report["adapter"], f"{tmp_path}/adapters/{report['adapter']}")]
+    assert engine.activated == []
+    assert engine.unloads == [report["adapter"]]
     buffer.close()
 
 
