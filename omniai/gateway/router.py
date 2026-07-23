@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from omniai.gateway.adapters import DiscordAdapter, RestAdapter, WebSocketAdapter
 from omniai.protocol import OmniMessage
+from omniai.settings import OmniSettings
 from omniai.telemetry import traced_span
 
 Handler = Callable[[OmniMessage], OmniMessage | Awaitable[OmniMessage]]
@@ -45,6 +46,11 @@ class GatewayRouter:
     observers:
         Fire-and-forget callbacks (sync or async) invoked with every inbound
         and outbound message — e.g. the memory InteractionBuffer.
+    settings:
+        Production hardening switch. When provided, the router validates the
+        security config (fail-closed on missing API keys), and installs
+        auth + rate-limit + body-size middleware and CORS. When omitted the
+        router runs open — embedded/test mode only.
     """
 
     def __init__(
@@ -53,15 +59,34 @@ class GatewayRouter:
         interceptors: list[Interceptor] | None = None,
         observers: list[Observer] | None = None,
         app: FastAPI | None = None,
+        settings: OmniSettings | None = None,
     ):
         self.handler = handler
         self.interceptors = list(interceptors or [])
         self.observers = list(observers or [])
         self.app = app or FastAPI(title="OmniAI Gateway")
+        self.settings = settings
         self.rest = RestAdapter()
         self.ws = WebSocketAdapter()
         self.discord = DiscordAdapter()
         self._register_routes()
+        if settings is not None:
+            self._apply_security(settings)
+
+    def _apply_security(self, settings: OmniSettings) -> None:
+        from starlette.middleware.cors import CORSMiddleware
+
+        from omniai.gateway.security import SecurityMiddleware
+
+        settings.validate_security()
+        if settings.cors_origins:
+            self.app.add_middleware(
+                CORSMiddleware,
+                allow_origins=settings.cors_origins,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
+        self.app.add_middleware(SecurityMiddleware, settings=settings)
 
     def add_interceptor(self, interceptor: Interceptor) -> None:
         self.interceptors.append(interceptor)
