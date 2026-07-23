@@ -13,9 +13,12 @@ COPY --from=builder /install /usr/local
 
 USER omniai
 WORKDIR /home/omniai
+COPY --chmod=0644 alembic.ini ./
+COPY --chmod=0755 migrations ./migrations
+COPY --chmod=0755 deploy/entrypoint.sh ./entrypoint.sh
 EXPOSE 8080
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health/live')" || exit 1
 
-CMD ["uvicorn", "omniai.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["./entrypoint.sh"]
