@@ -91,11 +91,11 @@ class PromptGuard:
                 # only redact sequences that pass the Luhn checksum.
                 n = 0
 
-                def _redact_if_card(match: re.Match[str]) -> str:
+                def _redact_if_card(match: re.Match[str], repl: str = replacement) -> str:
                     nonlocal n
                     if _luhn_valid(match.group()):
                         n += 1
-                        return replacement
+                        return repl
                     return match.group()
 
                 sanitized = rx.sub(_redact_if_card, sanitized)
