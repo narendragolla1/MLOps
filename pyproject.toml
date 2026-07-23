@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omniai"
+version = "0.1.0"
+description = "OmniAI / NexusGraph: unified LLM orchestration and serving framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OmniAI Contributors" }]
+dependencies = [
+    "pydantic>=2.5",
+    "fastapi>=0.110",
+    "httpx>=0.27",
+    "uvicorn>=0.29",
+    "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm>=0.5.0"]
+sglang = ["sglang>=0.3.0"]
+training = ["peft>=0.11", "trl>=0.9", "transformers>=4.40", "datasets>=2.19", "torch>=2.2"]
+telemetry = ["opentelemetry-api>=1.24", "opentelemetry-sdk>=1.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27"]
+
+[tool.setuptools.packages.find]
+include = ["omniai*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
