@@ -172,6 +172,14 @@ class ContinuousLearner:
         self.min_pairs = min_pairs
         self._lock = asyncio.Lock()
         self.history: list[dict[str, Any]] = []
+        # Observability hook: called with each cycle's report dict.
+        self.on_report: Callable[[dict[str, Any]], Any] | None = None
+
+    def _report(self, report: dict[str, Any]) -> dict[str, Any]:
+        self.history.append(report)
+        if self.on_report is not None:
+            self.on_report(report)
+        return report
 
     async def run_cycle(self) -> dict[str, Any]:
         """One full learning cycle; returns a status report."""
@@ -181,9 +189,9 @@ class ContinuousLearner:
                 system_prompt = getattr(self.engine, "system_prompt", None)
                 pairs = format_training_pairs(logs, system_prompt=system_prompt)
                 if len(pairs) < self.min_pairs:
-                    report = {"status": "skipped", "reason": "not_enough_pairs", "pairs": len(pairs)}
-                    self.history.append(report)
-                    return report
+                    return self._report(
+                        {"status": "skipped", "reason": "not_enough_pairs", "pairs": len(pairs)}
+                    )
 
                 name, path = await self.trainer.train(pairs)
 
@@ -198,16 +206,15 @@ class ContinuousLearner:
                             "reason": "failed_eval_gate",
                             "verdict": getattr(verdict, "__dict__", verdict),
                         }
-                        self.history.append(report)
-                        return report
+                        return self._report(report)
 
                 if self.engine is not None:
                     await self.engine.load_lora_adapter(name, path)
 
                 span.set_attributes({"adapter": name, "pairs": len(pairs)})
-                report = {"status": "deployed", "adapter": name, "path": path, "pairs": len(pairs)}
-                self.history.append(report)
-                return report
+                return self._report(
+                    {"status": "deployed", "adapter": name, "path": path, "pairs": len(pairs)}
+                )
 
     def trigger(self) -> "asyncio.Task[dict[str, Any]]":
         """Fire-and-forget cycle; suitable as an on_threshold callback."""

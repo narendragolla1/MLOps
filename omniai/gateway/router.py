@@ -61,12 +61,17 @@ class GatewayRouter:
         app: FastAPI | None = None,
         settings: OmniSettings | None = None,
         shutdown_hooks: list[Callable[[], Any]] | None = None,
+        engine: Any = None,
+        buffer: Any = None,
     ):
         self.handler = handler
         self.interceptors = list(interceptors or [])
         self.observers = list(observers or [])
         self.app = app or FastAPI(title="OmniAI Gateway")
         self.settings = settings
+        self.engine = engine
+        self.buffer = buffer
+        self.metrics = None
         self.rest = RestAdapter()
         self.ws = WebSocketAdapter()
         self.discord = DiscordAdapter()
@@ -75,7 +80,64 @@ class GatewayRouter:
         for hook in shutdown_hooks or []:
             self.app.add_event_handler("shutdown", hook)
         if settings is not None:
+            self._apply_observability(settings)
             self._apply_security(settings)
+
+    def _apply_observability(self, settings: OmniSettings) -> None:
+        from omniai.engine.resilience import BreakerState
+        from omniai.gateway.observability import (
+            Metrics,
+            configure_logging,
+            metrics_middleware,
+            request_id_middleware,
+            setup_tracing,
+        )
+
+        configure_logging(settings)
+        setup_tracing(settings)
+        metrics = self.metrics = Metrics()
+        # Middleware runs outermost-last-added: metrics inside request-id.
+        self.app.middleware("http")(metrics_middleware(metrics))
+        self.app.middleware("http")(request_id_middleware())
+
+        if self.engine is not None:
+            self.engine.on_usage = lambda prompt, completion: (
+                metrics.tokens.labels("prompt").inc(prompt),
+                metrics.tokens.labels("completion").inc(completion),
+            )
+
+        @self.app.get("/metrics")
+        async def metrics_endpoint() -> Any:
+            from fastapi.responses import Response
+
+            if self.engine is not None:
+                metrics.breaker_state.set(
+                    1 if self.engine.breaker.state is BreakerState.OPEN else 0
+                )
+            body, content_type = metrics.render()
+            return Response(content=body, media_type=content_type)
+
+        @self.app.get("/health/live")
+        async def liveness() -> dict[str, str]:
+            return {"status": "ok"}
+
+        @self.app.get("/health/ready")
+        async def readiness() -> Any:
+            from fastapi.responses import JSONResponse
+
+            problems: list[str] = []
+            if self.buffer is not None:
+                try:
+                    await self.buffer.count()
+                except Exception as exc:
+                    problems.append(f"database: {type(exc).__name__}")
+            if self.engine is not None and self.engine.breaker.state is BreakerState.OPEN:
+                problems.append("engine: circuit breaker open")
+            if problems:
+                return JSONResponse(
+                    status_code=503, content={"status": "unready", "problems": problems}
+                )
+            return {"status": "ready"}
 
     def _register_error_handlers(self) -> None:
         """Problem-details JSON for failures; never leak stack traces."""

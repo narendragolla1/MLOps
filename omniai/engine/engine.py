@@ -36,6 +36,8 @@ class ModelEngine:
             reset_timeout=config.breaker_reset_s,
         )
         self.supervisor: EngineSupervisor | None = None
+        # Observability hook: called with (prompt_tokens, completion_tokens).
+        self.on_usage: Any = None
         self._client: httpx.AsyncClient | None = None
 
     @classmethod
@@ -144,12 +146,13 @@ class ModelEngine:
             resp = await self._post("/v1/chat/completions", payload)
             data = resp.json()
             usage = data.get("usage") or {}
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
             span.set_attributes(
-                {
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0),
-                }
+                {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}
             )
+            if self.on_usage is not None:
+                self.on_usage(prompt_tokens, completion_tokens)
             return data
 
     async def chat_text(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
