@@ -21,6 +21,10 @@ flowchart LR
     EV -->|hot swap| E
 ```
 
+## Documentation
+
+Full documentation lives in [`docs/`](docs/index.md), organized LangChain-style: [Get started](docs/get_started/installation.md) · [Tutorials](docs/tutorials/index.md) · [How-to guides](docs/how_to/index.md) · [Concepts](docs/concepts/index.md) · [Integrations](docs/integrations/index.md) · [API reference](docs/reference/index.md) · [Security](docs/security.md).
+
 ## Quick start
 
 ```bash
