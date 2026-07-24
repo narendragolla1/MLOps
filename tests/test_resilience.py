@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import httpx
 import pytest
@@ -293,3 +294,347 @@ async def test_supervisor_ignores_healthy_process():
     await asyncio.sleep(0.05)
     await supervisor.stop()
     assert engine.adapter.starts == 0
+
+
+# -- EngineSupervisor extended tests ----------------------------------------
+
+
+async def test_supervisor_process_alive_checks():
+    """Verify _process_alive correctly detects process state."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=True)
+
+        def start(self):
+            self.process = FakeProcess(alive=True)
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = FakeAdapter()
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(engine)
+
+    # Process alive
+    assert supervisor._process_alive()
+
+    # Process dead
+    engine.adapter.process.alive = False
+    assert not supervisor._process_alive()
+
+    # No process
+    engine.adapter.process = None
+    assert not supervisor._process_alive()
+
+
+async def test_supervisor_tracks_restart_count():
+    """Verify supervisor increments restart counter."""
+    class CountingAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+            self.start_count = 0
+
+        def start(self):
+            self.start_count += 1
+            self.process = FakeProcess(alive=True)
+
+        async def wait_ready(self, timeout):
+            return True
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = CountingAdapter()
+            self.active_lora = None
+            self.active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.01, max_restarts=3, restart_backoff_base=0.001
+    )
+    supervisor.start()
+    await asyncio.sleep(0.2)
+    await supervisor.stop()
+
+    assert supervisor.restarts >= 1
+    assert supervisor.restarts <= supervisor.max_restarts
+    assert engine.adapter.start_count >= supervisor.restarts
+
+
+async def test_supervisor_enforces_max_restarts_limit():
+    """Verify supervisor fails when max_restarts is exceeded."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)  # always dead
+
+        def start(self):
+            self.process = FakeProcess(alive=False)  # stays dead
+
+        async def wait_ready(self, timeout):
+            return False  # never ready
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = FakeAdapter()
+            self.active_lora = None
+            self.active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.01, max_restarts=2, restart_backoff_base=0.001
+    )
+    supervisor.start()
+    await asyncio.sleep(0.2)
+
+    assert supervisor.failed
+    assert "max_restarts" in (supervisor.failure_reason or "")
+    await supervisor.stop()
+
+
+async def test_supervisor_without_active_lora():
+    """Verify supervisor handles case where no LoRA is active."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+
+        def start(self):
+            self.process = FakeProcess(alive=True)
+
+        async def wait_ready(self, timeout):
+            return True
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = FakeAdapter()
+            self.active_lora = None
+            self.active_lora_path = None
+            self.lora_loads = []
+
+        async def load_lora_adapter(self, name, path):
+            self.lora_loads.append((name, path))
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.01, max_restarts=3, restart_backoff_base=0.01
+    )
+    supervisor.start()
+    await asyncio.sleep(0.15)
+    await supervisor.stop()
+
+    assert engine.adapter.process.alive
+    assert len(engine.lora_loads) == 0  # No LoRA to load
+
+
+async def test_supervisor_wait_ready_timeout():
+    """Verify supervisor retries when wait_ready times out."""
+    class SlowAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+            self.wait_ready_calls = 0
+
+        def start(self):
+            self.process = FakeProcess(alive=True)
+            self.wait_ready_calls = 0
+
+        async def wait_ready(self, timeout):
+            self.wait_ready_calls += 1
+            return False  # Never ready
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = SlowAdapter()
+            self.active_lora = None
+            self.active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.02, max_restarts=2, restart_backoff_base=0.001
+    )
+    supervisor.start()
+    await asyncio.sleep(0.15)
+
+    # Process should have been detected as dead and restarted
+    assert supervisor.restarts >= 1
+    await supervisor.stop()
+
+
+async def test_supervisor_graceful_stop_cancels_watch():
+    """Verify supervisor.stop() cancels the watch task."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=True)
+
+    class FakeEngine:
+        adapter = FakeAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(engine, check_interval=0.01)
+
+    assert supervisor._task is None
+    supervisor.start()
+    assert supervisor._task is not None
+    task = supervisor._task
+
+    await supervisor.stop()
+    assert supervisor._task is None
+    assert task.cancelled() or task.done()
+
+
+async def test_supervisor_multiple_restarts_with_backoff():
+    """Verify supervisor applies backoff between restarts."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+            self.start_times = []
+
+        def start(self):
+            self.start_times.append(time.monotonic())
+            self.process = FakeProcess(alive=True)
+
+        async def wait_ready(self, timeout):
+            # Die immediately so supervisor tries restart again
+            self.process = FakeProcess(alive=False)
+            return True
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = FakeAdapter()
+            self.active_lora = None
+            self.active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.01, max_restarts=2, restart_backoff_base=0.02
+    )
+    supervisor.start()
+    await asyncio.sleep(0.2)
+    await supervisor.stop()
+
+    assert len(engine.adapter.start_times) >= 2
+    # Check that there's a gap between restart attempts (backoff)
+    if len(engine.adapter.start_times) >= 2:
+        gap = engine.adapter.start_times[1] - engine.adapter.start_times[0]
+        assert gap > 0.01  # Should have some backoff
+
+
+async def test_supervisor_start_is_idempotent():
+    """Verify calling start() multiple times doesn't create multiple tasks."""
+    class FakeAdapter:
+        process = FakeProcess(alive=True)
+
+    class FakeEngine:
+        adapter = FakeAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    supervisor = EngineSupervisor(FakeEngine(), check_interval=0.01)
+
+    supervisor.start()
+    task1 = supervisor._task
+    supervisor.start()
+    task2 = supervisor._task
+
+    assert task1 is task2  # Same task
+    await supervisor.stop()
+
+
+async def test_supervisor_stop_without_start():
+    """Verify supervisor.stop() is safe to call without start()."""
+    class FakeAdapter:
+        process = FakeProcess(alive=True)
+
+    class FakeEngine:
+        adapter = FakeAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    supervisor = EngineSupervisor(FakeEngine())
+    # Should not raise
+    await supervisor.stop()
+    assert supervisor._task is None
+
+
+async def test_supervisor_exception_in_restart_sets_failed():
+    """Verify supervisor sets failed flag when restart fails."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+
+        def start(self):
+            raise RuntimeError("cannot start")
+
+        async def wait_ready(self, timeout):
+            return False
+
+    class FakeEngine:
+        adapter = FakeAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    supervisor = EngineSupervisor(
+        FakeEngine(), check_interval=0.01, max_restarts=1, restart_backoff_base=0.001
+    )
+    supervisor.start()
+    await asyncio.sleep(0.1)
+
+    assert supervisor.failed
+    assert supervisor.failure_reason is not None
+    assert "cannot start" in supervisor.failure_reason
+    await supervisor.stop()
+
+
+async def test_supervisor_lora_reapply_called_after_restart():
+    """Verify supervisor reapplies LoRA after successful restart."""
+    lora_calls = []
+
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=False)
+            self.restart_count = 0
+
+        def start(self):
+            self.restart_count += 1
+            self.process = FakeProcess(alive=True)
+
+        async def wait_ready(self, timeout):
+            return True
+
+    class FakeEngine:
+        def __init__(self):
+            self.adapter = FakeAdapter()
+            self.active_lora = "adapter-v2"
+            self.active_lora_path = "/path/to/adapter-v2"
+
+        async def load_lora_adapter(self, name, path):
+            lora_calls.append((name, path))
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(
+        engine, check_interval=0.01, max_restarts=2, restart_backoff_base=0.01
+    )
+    supervisor.start()
+    await asyncio.sleep(0.15)
+    await supervisor.stop()
+
+    assert ("adapter-v2", "/path/to/adapter-v2") in lora_calls
+
+
+async def test_supervisor_stopped_event_signal():
+    """Verify supervisor respects _stopped event."""
+    class FakeAdapter:
+        def __init__(self):
+            self.process = FakeProcess(alive=True)
+
+    class FakeEngine:
+        adapter = FakeAdapter()
+        active_lora = None
+        active_lora_path = None
+
+    engine = FakeEngine()
+    supervisor = EngineSupervisor(engine, check_interval=0.01)
+    supervisor.start()
+    assert not supervisor._stopped.is_set()
+
+    await supervisor.stop()
+    assert supervisor._stopped.is_set()
